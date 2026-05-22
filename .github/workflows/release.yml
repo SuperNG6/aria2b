@@ -29,6 +29,8 @@ jobs:
         run: npm ci
       - name: Syntax check
         run: node --check app.js
+      - name: Lint
+        run: npm run lint
       - name: Run tests
         run: node --test 'test/*.test.js'
       - name: Resolve tag
@@ -64,7 +66,9 @@ jobs:
 
           # 用 esbuild 把所有 npm 依赖 bundle 进单文件（shebang 由 app.js 头部自带）。
           # 这样 docker-aria2 等场景下 curl 下来的 aria2b 不需要 node_modules 即可运行。
-          npx --yes esbuild@0.27.1 app.js \
+          # esbuild 已经作为 devDependency 装好（npm ci 走 actions/setup-node 缓存），
+          # 这里直接调本地版本，避免每次 release 都从 npm registry 拉一遍。
+          npx esbuild app.js \
             --bundle --platform=node --target=node22 \
             --format=cjs --legal-comments=none \
             --outfile=dist/aria2b
@@ -86,9 +90,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.tag.outputs.tag }}"
-          gh release create "$tag" \
-            dist/aria2b \
-            aria2b-*.tgz \
-            dist/*.sha256 \
-            --title "$tag" \
-            --generate-notes
+          # 优先用仓库里的 RELEASE_NOTES.md 作为 release body；缺失时退回自动生成。
+          # 这样每次发版的更新说明在 commit 里就是 reviewable 的，不依赖 GH 自动归并。
+          if [ -s RELEASE_NOTES.md ]; then
+            gh release create "$tag" \
+              dist/aria2b \
+              aria2b-*.tgz \
+              dist/*.sha256 \
+              --title "$tag" \
+              --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$tag" \
+              dist/aria2b \
+              aria2b-*.tgz \
+              dist/*.sha256 \
+              --title "$tag" \
+              --generate-notes
+          fi

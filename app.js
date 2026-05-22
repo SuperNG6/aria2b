@@ -15,7 +15,6 @@ const http = require('http')
 const https = require('https')
 const child_process = require('child_process')
 const { promisify } = require('util')
-const axios = require('axios')
 const getPeerName = require('@huggycn/bittorrent-peerid')
 
 // ============================================================================
@@ -33,6 +32,7 @@ const DEFAULT_SCAN_INTERVAL = 5000
 const MIN_SCAN_INTERVAL = 1000
 const MAX_SCAN_INTERVAL = 60000
 const RPC_HTTP_TIMEOUT = 30000
+const RPC_MAX_BODY_BYTES = 64 * 1024 * 1024
 const MAX_BACKOFF_DELAY = 60000
 const MAX_BLOCKED_IPS = 200000   // ipset hash:ip 默认 65536，本地缓存放宽一些
 const MAX_PEER_STATE = 50000     // peer 状态机容量上限（防意外膨胀）
@@ -142,6 +142,9 @@ function parseList(value) {
 }
 
 function parsePositiveInteger(value, fallback) {
+    // 显式拒绝 boolean / null / undefined / object：避免 `--key` 不带值时
+    // value=true 被 Number() 转成 1 静默落入配置（B5）。
+    if (typeof value !== 'string' && typeof value !== 'number') return fallback
     const n = Number(value)
     return (Number.isInteger(n) && n > 0) ? n : fallback
 }
@@ -207,7 +210,14 @@ function isLocalHttpsRpcUrl(url) {
     if (u.protocol !== 'https:') return false
     // WHATWG URL 对 IPv6 字面量保留方括号
     const host = u.hostname.replace(/^\[|\]$/g, '')
-    return host === 'localhost' || host === '::1' || host.startsWith('127.')
+    if (host === 'localhost' || host === '::1') return true
+    // 必须是合法 IPv4 字面量，且在 127/8 段内。
+    // 不能简单用 `host.startsWith('127.')`，否则 `127.0.0.1.evil.com`
+    // 也会被当成本地 → 攻击者控制的子域可让 TLS 校验被默认关闭。
+    if (net.isIPv4(host)) {
+        return host.startsWith('127.')
+    }
+    return false
 }
 
 function hasIpset(saveOutput, setName) {
@@ -219,8 +229,13 @@ function hasIpset(saveOutput, setName) {
 }
 
 /**
- * 把 axios/Node 错误压缩成短字符串，关键作用：避免把请求体里的
+ * 把 Node 网络错误压缩成短字符串，关键作用：避免把请求体里的
  * `token:secret` 写到日志。容器场景下日志常被采集，这里必须脱敏。
+ *
+ * 兼容字段（由 makeRpcClient/httpJsonPost 抛出，与历史 axios 错误形态一致）：
+ *   e.code: ECONNREFUSED / ECONNRESET / ETIMEDOUT / ECONNABORTED / ENOTFOUND / EHOSTUNREACH / EMSGSIZE
+ *   e.address / e.port:  Node 原生附带（ECONNREFUSED 等）
+ *   e.response.{status, statusText}: HTTP 非 2xx 状态码
  */
 function sanitizeError(e) {
     if (!e) return 'unknown error'
@@ -233,6 +248,8 @@ function sanitizeError(e) {
     if (e.code === 'ETIMEDOUT' || e.code === 'ECONNABORTED') return 'RPC 请求超时'
     if (e.code === 'ENOTFOUND') return `RPC 域名解析失败: ${e.hostname || ''}`
     if (e.code === 'EHOSTUNREACH') return 'RPC 主机不可达'
+    if (e.code === 'EMSGSIZE') return 'RPC 响应体超出上限'
+    if (e.code === 'EBADRESPONSE') return e.message || 'RPC 响应解析失败'
     if (e.response) {
         const { status, statusText } = e.response
         return `HTTP ${status} ${statusText || ''}`.trim()
@@ -295,17 +312,127 @@ function cleanupBlockedIps() {
 // RPC
 // ============================================================================
 
+/**
+ * 用 Node 原生 http/https.request 发 JSON POST，返回 axios 风格的
+ * `{ data, status, statusText }`。失败时抛出的 error 形态与 sanitizeError
+ * 的兼容契约：
+ *   - 连接层错误透传原生 e.code / e.address / e.port（ECONNREFUSED 等）
+ *   - HTTP 状态码 >= 400 时抛带 `e.response = { status, statusText }` 的错误
+ *   - 超时抛 `{ code: 'ECONNABORTED' }`，与 axios 风格对齐
+ *   - 响应体超过 RPC_MAX_BODY_BYTES 时抛 `EMSGSIZE`，并主动 abort 连接
+ *
+ * 不实现：重定向跟随（aria2 RPC 不会重定向）、代理（localhost RPC 不需要）、
+ * multipart（我们只发 JSON）。砍掉这些是替换 axios 的全部价值。
+ */
+function httpJsonPost(opts, url, body) {
+    return new Promise((resolve, reject) => {
+        let parsed
+        try { parsed = new URL(url) }
+        catch (_) { return reject(new Error(`rpc url 格式不正确: ${url}`)) }
+
+        const isHttps = parsed.protocol === 'https:'
+        const lib = isHttps ? https : http
+        const agent = isHttps ? opts.httpsAgent : opts.httpAgent
+
+        const payload = Buffer.from(JSON.stringify(body), 'utf8')
+
+        const reqOpts = {
+            method: 'POST',
+            protocol: parsed.protocol,
+            hostname: parsed.hostname,
+            port: parsed.port || (isHttps ? 443 : 80),
+            path: (parsed.pathname || '/') + (parsed.search || ''),
+            agent,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': payload.length,
+                'Accept': 'application/json',
+                // 主动让对端用 close 还是 keep-alive 由 Agent 决定
+            }
+        }
+
+        const req = lib.request(reqOpts, (res) => {
+            const chunks = []
+            let received = 0
+            let aborted = false
+
+            res.on('data', (chunk) => {
+                if (aborted) return
+                received += chunk.length
+                if (received > RPC_MAX_BODY_BYTES) {
+                    aborted = true
+                    // 销毁 res 而不是 req — 销毁 req 在某些 Node 版本会触发
+                    // 二次 'error' 事件；销毁 res 的 socket 即可中断接收
+                    res.destroy()
+                    const err = new Error(`响应体超过 ${RPC_MAX_BODY_BYTES} 字节上限`)
+                    err.code = 'EMSGSIZE'
+                    return reject(err)
+                }
+                chunks.push(chunk)
+            })
+            res.on('end', () => {
+                if (aborted) return
+                const text = Buffer.concat(chunks).toString('utf8')
+                const status = res.statusCode
+                const statusText = res.statusMessage || ''
+                // 3xx 在 aria2 RPC 里也不应出现；当作错误抛而不是静默把 data 当 undefined
+                // 处理，否则 cron 会把异常的空响应当成"无活跃任务"——隐患远大于收益。
+                if (status >= 300) {
+                    const err = new Error(`HTTP ${status} ${statusText}`.trim())
+                    err.response = { status, statusText }
+                    return reject(err)
+                }
+                let data
+                try { data = text ? JSON.parse(text) : undefined }
+                catch (e) {
+                    const err = new Error(`RPC 响应不是合法 JSON: ${sanitizeError(e)}`)
+                    err.code = 'EBADRESPONSE'
+                    return reject(err)
+                }
+                resolve({ data, status, statusText })
+            })
+            res.on('error', reject)
+        })
+
+        // 绝对超时：用外层 setTimeout 包整个请求，覆盖 connect 阶段。
+        // 不能只用 req.setTimeout —— 那只是 socket 分配后才生效，
+        // connect 卡住时会被 TCP 内核默认的 ~2 分钟超时拖死。
+        // 用 ECONNABORTED 对齐 axios 风格，sanitizeError 不用改。
+        let absoluteTimer = null
+        const clearAbsoluteTimer = () => {
+            if (absoluteTimer) { clearTimeout(absoluteTimer); absoluteTimer = null }
+        }
+        if (opts.timeout && opts.timeout > 0) {
+            absoluteTimer = setTimeout(() => {
+                const err = new Error('RPC 请求超时')
+                err.code = 'ECONNABORTED'
+                req.destroy(err)
+            }, opts.timeout)
+        }
+        req.on('response', clearAbsoluteTimer)
+        req.on('error', (err) => { clearAbsoluteTimer(); reject(err) })
+        req.on('close', clearAbsoluteTimer)
+        req.end(payload)
+    })
+}
+
 function makeRpcClient() {
     const agentOpts = { keepAlive: true, keepAliveMsecs: 30000, maxSockets: 4 }
-    return axios.create({
+    const opts = {
         timeout: RPC_HTTP_TIMEOUT,
         httpAgent: new http.Agent(agentOpts),
-        httpsAgent: new https.Agent({ ...agentOpts, ...config.rpc_options }),
-        // 默认情况下，axios 在 status >= 400 时会抛错；让它抛，由上层处理
-        // 关闭自动 transform 也无所谓，性能影响很小
-        maxContentLength: 64 * 1024 * 1024,
-        maxBodyLength: 64 * 1024 * 1024
-    })
+        httpsAgent: new https.Agent({ ...agentOpts, ...config.rpc_options })
+    }
+    return {
+        // 维持 axios 风格 .post(url, body) → { data, status, statusText }，
+        // 让历史测试与 sanitizeError 的错误形态兼容不变。
+        post(url, body) { return httpJsonPost(opts, url, body) },
+        // 给关停 / 测试用：销毁 agent，释放 keep-alive sockets
+        destroy() {
+            try { opts.httpAgent.destroy() } catch (_) {}
+            try { opts.httpsAgent.destroy() } catch (_) {}
+        }
+    }
 }
 
 let _rpcIdCounter = 0
@@ -432,7 +559,11 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
     const bitprogress = countOnes(peer.bitfield)
     let toBlock = false
 
-    if (keywordMatches(config.block_keywords, c.origin)) {
+    if (keywordMatches(config.block_keywords, c.origin) ||
+        (hasUnknownKeyword(config.block_keywords) && c.client === 'unknown')) {
+        // keywordMatches 显式跳过 'unknown' 关键字，未知客户端的 ban 路径必须由
+        // hasUnknownKeyword + c.client==='unknown' 显式接管，否则 block_keywords
+        // 里加 Unknown 就只是个装饰。
         toBlock = true
     } else {
         const isNoProgTarget =
@@ -544,8 +675,12 @@ function backoffDelay() {
 
 function scheduleNext() {
     if (shuttingDown) return
+    // 不要对 scanTimer 调 unref：
+    // Node 的 http.Agent keep-alive 空闲 socket 自带 unref，cron 跑完后没有任何
+    // refed handle，如果再把 scanTimer 也 unref，事件循环会立刻判定无事可做、
+    // 进程静默 exit(0)，被外面的 s6 / systemd 不断拉起，看起来像"反复重启"。
+    // SIGTERM 处理器已经显式 clearTimeout(scanTimer) + process.exit(0)，无需 unref。
     scanTimer = setTimeout(runLoop, backoffDelay())
-    if (typeof scanTimer.unref === 'function') scanTimer.unref()
 }
 
 async function runLoop() {
@@ -624,20 +759,16 @@ function findAria2Config() {
  * 极简 CLI 解析器。支持：
  *   --key value      --key=value      --key（无值视为 true）
  *   -k value         -kv 不支持（避免歧义）
- * 数字串自动转 Number；short alias 映射到 long key（保持 kebab-case）。
+ * 不做类型转换：value 始终是字符串（或 true）。
+ * 数字字段由 applyPositiveIntegerConfig / parseBoolean 在 applyCliConfig 里
+ * 各自显式 Number()，避免把 secret/path/url 这种纯数字字面量在解析阶段
+ * 静默改值（例如 --secret 001234 不应丢前导 0）。
  * 自行实现是为了：① 砍掉 yargs-parser 依赖让 bundle 真正自包含；
  *                  ② 简单、稳定、可测、零运行时风险。
  */
 const ARG_ALIAS = {
     c: 'config', u: 'url', s: 'secret', b: 'block-keywords',
     h: 'help', v: 'version'
-}
-
-function _coerceNumeric(s) {
-    if (typeof s !== 'string' || s === '') return s
-    if (!/^-?\d+(\.\d+)?$/.test(s)) return s
-    const n = Number(s)
-    return Number.isFinite(n) ? n : s
 }
 
 function parseArgv(args) {
@@ -651,12 +782,12 @@ function parseArgv(args) {
             const eq = a.indexOf('=')
             if (eq >= 0) {
                 key = a.slice(2, eq)
-                val = _coerceNumeric(a.slice(eq + 1))
+                val = a.slice(eq + 1)
             } else {
                 key = a.slice(2)
                 const next = args[i + 1]
                 if (next !== undefined && (typeof next !== 'string' || !next.startsWith('-'))) {
-                    val = _coerceNumeric(next); i++
+                    val = next; i++
                 } else {
                     val = true
                 }
@@ -666,7 +797,7 @@ function parseArgv(args) {
             key = ARG_ALIAS[shortKey] || shortKey
             const next = args[i + 1]
             if (next !== undefined && (typeof next !== 'string' || !next.startsWith('-'))) {
-                val = _coerceNumeric(next); i++
+                val = next; i++
             } else {
                 val = true
             }
@@ -745,6 +876,12 @@ function installSignalHandlers() {
         shuttingDown = true
         honsole.log(`收到 ${signal}，等待当前扫描结束后退出`)
         if (scanTimer) { clearTimeout(scanTimer); scanTimer = null }
+        // 主动销毁 rpcClient agent：让飞行中的 RPC 立刻 ECONNRESET 收尾，
+        // cron 会进 catch 分支并 return。否则要等最长 30s 的 RPC 超时
+        // 才能 await cronInflight 解开。容器关停从秒级降到毫秒级。
+        if (rpcClient && typeof rpcClient.destroy === 'function') {
+            try { rpcClient.destroy() } catch (_) { /* ignore */ }
+        }
         if (cronInflight) {
             try { await cronInflight } catch (_) { /* ignore */ }
         }
@@ -849,8 +986,10 @@ module.exports = {
         parseArgv, applyCliConfig, applyNoVerify, loadConfigFromAria2File,
         // ipset / iptables
         flushIptablesIpset, blockIp,
+        // RPC
+        httpJsonPost,
         // cron
-        processOnePeer, cron, backoffDelay,
+        processOnePeer, cron, backoffDelay, scheduleNext,
         // 状态控制（测试用）
         _reset() {
             blockedIps.clear()
@@ -861,6 +1000,8 @@ module.exports = {
         },
         _getFailures() { return consecutiveFailures },
         _setFailures(n) { consecutiveFailures = n },
+        _getScanTimer() { return scanTimer },
+        _clearScanTimer() { if (scanTimer) { clearTimeout(scanTimer); scanTimer = null } },
         _setArgv(v) { argv = v },
         _getArgv() { return argv },
         _setRpcClient(c) { rpcClient = c },

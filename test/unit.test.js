@@ -145,6 +145,24 @@ test('isLocalHttpsRpcUrl: 识别本地 https 的几种写法', () => {
     assert.throws(() => isLocalHttpsRpcUrl('not a url'))
 })
 
+test('isLocalHttpsRpcUrl: 防止 127.x 子域绕过（B3 安全回归）', () => {
+    // 旧版用 host.startsWith('127.')，攻击者控制的 DNS 可让
+    // https://127.0.0.1.evil.com/jsonrpc 被当成本地 → TLS 校验默认关闭。
+    assert.equal(isLocalHttpsRpcUrl('https://127.0.0.1.evil.com/jsonrpc'), false,
+        '127.0.0.1.evil.com 必须不被识别为本地')
+    assert.equal(isLocalHttpsRpcUrl('https://127.0.0.1.attacker.test/'), false,
+        '在合法 IPv4 后追加任意子域也不能算本地')
+    // localhost 子域也不算
+    assert.equal(isLocalHttpsRpcUrl('https://localhost.evil.com/jsonrpc'), false)
+    // 但 127.x.y.z 整段都是合法 IPv4 → 应识别为本地
+    assert.equal(isLocalHttpsRpcUrl('https://127.0.0.1/jsonrpc'), true)
+    assert.equal(isLocalHttpsRpcUrl('https://127.255.255.255/jsonrpc'), true)
+    // 类 IPv4 但非法的字符串：URL 解析层会拒绝（hostname 含 IPv4-shaped 前缀但带字母）
+    // 这种情况由 new URL() 自身抛错，不会走到 startsWith 分支 —— 即便有 startsWith 也没机会触发
+    assert.throws(() => isLocalHttpsRpcUrl('https://127a.0.0.1/jsonrpc'),
+        /rpc url 格式不正确/, '类 IPv4 非法形态由 URL 解析直接拦下')
+})
+
 // ---------- hasIpset ----------
 test('hasIpset: 精确匹配 create 行', () => {
     const out = [

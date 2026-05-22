@@ -27,7 +27,9 @@ test('parseArgv: alias 与基础选项', () => {
     assert.equal(parseArgv(['--help']).help, true)
     assert.equal(parseArgv(['--version']).version, true)
     assert.equal(parseArgv(['--rpc-no-verify', 'false'])['rpc-no-verify'], 'false')
-    assert.equal(parseArgv(['--scan-interval', '2000'])['scan-interval'], 2000)
+    // parseArgv 不再做数字强转：value 始终是 string（避免 --secret 001234
+    // 在解析阶段丢失前导 0）。数字字段由 applyPositiveIntegerConfig 转。
+    assert.equal(parseArgv(['--scan-interval', '2000'])['scan-interval'], '2000')
 })
 
 // ---------- applyNoVerify ----------

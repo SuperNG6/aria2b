@@ -10,7 +10,7 @@ const { _internal } = require('../app.js')
 
 const {
     config, blockedIps, peerState, runtime,
-    cron, processOnePeer, isBlocked,
+    cron, isBlocked,
     _reset, _setRpcClient, _makeRpcClient
 } = _internal
 
@@ -107,6 +107,84 @@ test('cron: 关键字命中（XL）→ ipset add 调用', async (t) => {
     assert.equal(isBlocked('203.0.113.5'), true, 'IP 应进入本地缓存')
 })
 
+// ---------- cron: B2 回归 — block_keywords 含 Unknown 必须直接屏蔽未知客户端 ----------
+
+test('cron: block_keywords 含 Unknown 时直接屏蔽未知客户端（B2 回归）', async (t) => {
+    _reset()
+    config.block_keywords = ['Unknown']
+    config.noprogress_keywords = ['NEVER']   // 关掉 noprogress 通道，确保命中只能来自 block 路径
+
+    const mock = await startMockAria2((req) => {
+        if (req.method === 'aria2.tellActive') return { result: [{ gid: 'g' }] }
+        if (req.method === 'system.multicall') {
+            const calls = req.params[0]
+            const results = calls.map(c => {
+                if (c.methodName === 'aria2.tellStatus') return [{ numPieces: 100, pieceLength: 16384 }]
+                if (c.methodName === 'aria2.getPeers') return [[
+                    {
+                        // 一段不符合任何已知客户端格式的 peerId → getPeerName 返回 { client: 'unknown' }
+                        peerId: '%2D%2D%2D%2D%2D%2D%2D%2Ddeadbeefcafe',
+                        ip: '198.51.100.5',
+                        uploadSpeed: 1,         // 即使速度极低也要 ban（不走 noprogress 通道）
+                        downloadSpeed: 999,     // 即使在下载也要 ban
+                        bitfield: 'ff'           // 有进度也要 ban
+                    }
+                ]]
+                return [null]
+            })
+            return { result: results }
+        }
+        return { result: [] }
+    })
+    t.after(() => mock.close())
+
+    config.rpc_url = mock.url
+    _setRpcClient(_makeRpcClient())
+    const spy = spyExecFile()
+    t.after(() => spy.restore())
+
+    await cron()
+    const adds = spy.calls.filter(c => c.file === 'ipset' && c.args[0] === 'add')
+    assert.equal(adds.length, 1, 'block_keywords=[Unknown] 必须直接 ban 未知客户端，不经过 noprogress 通道')
+    assert.equal(adds[0].args[3], '198.51.100.5')
+})
+
+test('cron: block_keywords 不含 Unknown 时不会误封未知客户端（B2 反向）', async (t) => {
+    _reset()
+    config.block_keywords = ['XL']           // 不含 Unknown
+    config.noprogress_keywords = ['NEVER']   // noprogress 也关掉
+
+    const mock = await startMockAria2((req) => {
+        if (req.method === 'aria2.tellActive') return { result: [{ gid: 'g' }] }
+        if (req.method === 'system.multicall') {
+            const calls = req.params[0]
+            const results = calls.map(c => {
+                if (c.methodName === 'aria2.tellStatus') return [{ numPieces: 100, pieceLength: 16384 }]
+                if (c.methodName === 'aria2.getPeers') return [[
+                    {
+                        peerId: '%2D%2D%2D%2D%2D%2D%2D%2Ddeadbeefcafe',
+                        ip: '198.51.100.6',
+                        uploadSpeed: 1, downloadSpeed: 999, bitfield: 'ff'
+                    }
+                ]]
+                return [null]
+            })
+            return { result: results }
+        }
+        return { result: [] }
+    })
+    t.after(() => mock.close())
+
+    config.rpc_url = mock.url
+    _setRpcClient(_makeRpcClient())
+    const spy = spyExecFile()
+    t.after(() => spy.restore())
+
+    await cron()
+    const adds = spy.calls.filter(c => c.file === 'ipset' && c.args[0] === 'add')
+    assert.equal(adds.length, 0, '未配置 Unknown 时不应误封未知客户端')
+})
+
 // ---------- cron: noprogress 流程 ----------
 
 test('cron: noprogress 计数器累积、不重置（部分 RPC 失败时）', async (t) => {
@@ -175,7 +253,7 @@ test('cron: noprogress 计数器累积、不重置（部分 RPC 失败时）', a
     // 恢复，再扫一轮 → wait 应再 +1 = 2，仍未超阈值
     mode = 'ok'
     await cron()
-    let states2 = [...peerState.values()]
+    const states2 = [...peerState.values()]
     assert.equal(states2[0].wait, 2)
     banCalls = spy.calls.filter(c => c.file === 'ipset' && c.args[0] === 'add')
     assert.equal(banCalls.length, 0, '第 3 轮仍不应 ban（wait=2，阈值是 > 2）')
@@ -375,3 +453,24 @@ test('backoffDelay: 成功时 = scan_interval，失败时指数退避到上限',
     _internal._setFailures(10)  // 远超上限
     assert.equal(_internal.backoffDelay(), 60000, '应被 MAX_BACKOFF_DELAY 截断')
 })
+
+// ---------- scheduleNext: 回归测试 ----------
+
+test('scheduleNext: 装的 timer 必须保持 refed（否则进程会静默退出被 s6 反复拉起）', () => {
+    _reset()
+    config.scan_interval = 5000
+    try {
+        _internal.scheduleNext()
+        const t = _internal._getScanTimer()
+        assert.ok(t, 'scheduleNext 应当装上 timer')
+        // hasRef() 自 Node 11 起就有；如果将来真要 unref 必须把这条注释一起改了
+        assert.equal(typeof t.hasRef, 'function')
+        assert.equal(t.hasRef(), true,
+            'scanTimer 不能 unref —— http.Agent 的 keep-alive idle socket 自带 unref，' +
+            '若 scanTimer 再 unref，事件循环无 refed handle，Node 会安静 exit(0)，' +
+            '在 docker s6 之类的进程管理器下会被反复拉起。')
+    } finally {
+        _internal._clearScanTimer()
+    }
+})
+

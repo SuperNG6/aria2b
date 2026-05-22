@@ -28,6 +28,8 @@ jobs:
         run: npm ci
       - name: Syntax check
         run: node --check app.js
+      - name: Lint
+        run: npm run lint
       - name: Unit & integration tests
         run: node --test --test-reporter=spec 'test/*.test.js'
       - name: CLI smoke test (-h / -v)
