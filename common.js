@@ -2,15 +2,20 @@
 // 代码来自 https://github.com/mayswind/AriaNg/blob/a091ee850ff45a56ab033f821727c1ad24049a60/src/scripts/services/ariaNgCommonService.js#L91
 function decodePercentEncodedString(s) {
   if (!s) {
-    return 'Unknow'
+    return 'Unknown'
   }
   var ret = ''
   for (var i = 0; i < s.length; i++) {
     var ch = s.charAt(i)
     if (ch === '%' && i < s.length - 2) {
       var code = s.substring(i + 1, i + 3)
-      ret += String.fromCharCode(parseInt(code, 16))
-      i += 2
+      var parsed = parseInt(code, 16)
+      if (!Number.isNaN(parsed)) {
+        ret += String.fromCharCode(parsed)
+        i += 2
+      } else {
+        ret += ch
+      }
     } else {
       ret += ch
     }
@@ -50,7 +55,9 @@ const honsole = {
     console.warn('[aria2b]', ...args)
   }
 }
-const exec = require('util').promisify((require('child_process')).exec)
+const child_process = require('child_process')
+const exec = require('util').promisify(child_process.exec)
+const execFile = require('util').promisify(child_process.execFile)
 // const exec = (cmd)=>{
 //   console.log(cmd)
 //   return {
@@ -67,11 +74,22 @@ const execR = async (cmd) => {
   }
 }
 
+const execFileR = async (file, args = []) => {
+  try {
+    return await execFile(file, args)
+  } catch (error) {
+    honsole.dev(error)
+    return 'error'
+  }
+}
+
 module.exports = {
   decodePercentEncodedString,
   asyncForEach,
   dt,
   honsole,
   exec,
-  execR
+  execR,
+  execFile,
+  execFileR
 }

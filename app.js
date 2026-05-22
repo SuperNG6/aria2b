@@ -9,10 +9,11 @@ const axios = require('axios')
 const argv = require('yargs-parser')(process.argv.slice(2))
 const get_peer_name = require('@huggycn/bittorrent-peerid')
 const https = require('https')
+const net = require('net')
 let r_rpc = axios.default.create({
     timeout: 60000 // = 60秒
 })
-const { asyncForEach, decodePercentEncodedString, honsole, exec, execR } = require('./common')
+const { asyncForEach, decodePercentEncodedString, honsole, execFile, execFileR } = require('./common')
 
 // 默认配置
 let config = {
@@ -34,13 +35,13 @@ let config = {
     noprogress_wait: 10, // ↑计数到这么多次还是没有进度就 ban。默认：10
     ipv6: false
 }
-// 保留
-let blocked_ips = []
+// 记录本进程已经封禁过且尚未过期的 IP，避免重复调用 ipset。
+let blocked_ips = new Map()
 let cron_processing_flag = true
-let peerUploaded = []   // [peerId,gid,type] = [uploaded, over 5 timeout]
+let peerUploaded = new Map()
 
 function decodeClient(str) {
-    return str.replace(/%[0-9A-Fa-f]{2}/g, match => {
+    return String(str || '').replace(/%[0-9A-Fa-f]{2}/g, match => {
         const charCode = parseInt(match.slice(1), 16);
         // Decode only if the character is printable ASCII
         if (charCode >= 32 && charCode <= 126) {
@@ -79,8 +80,164 @@ function countOnes(hexString) {
     return count;
 }
 
+function parseList(value) {
+    return String(value || '')
+        .split(',')
+        .map(x => x.trim())
+        .filter(Boolean)
+}
+
+function parsePositiveInteger(value, fallback) {
+    const parsed = Number(value)
+    if (Number.isInteger(parsed) && parsed > 0) {
+        return parsed
+    }
+    return fallback
+}
+
+function parseBoolean(value, fallback = true) {
+    if (value === undefined || value === null || value === '') {
+        return fallback
+    }
+    if (typeof value === 'boolean') {
+        return value
+    }
+    const normalized = String(value).trim().toLowerCase()
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+        return true
+    }
+    if (['0', 'false', 'no', 'off'].includes(normalized)) {
+        return false
+    }
+    return fallback
+}
+
+function hasUnknownKeyword(keywords) {
+    return keywords.some(keyword => keyword.toLowerCase() === 'unknown')
+}
+
+function keywordMatches(keywords, origin) {
+    const text = String(origin || '')
+    return keywords.some(keyword => keyword.toLowerCase() !== 'unknown' && text.includes(keyword))
+}
+
+function peerStateKey(peer, gid) {
+    return [gid, peer.peerId || '', peer.ip || ''].join('\0')
+}
+
+function getPeerState(key) {
+    let state = peerUploaded.get(key)
+    if (!state) {
+        state = { uploaded: 0, wait: 0 }
+        peerUploaded.set(key, state)
+    }
+    return state
+}
+
+function cleanupPeerUploaded(activeKeys) {
+    for (const key of peerUploaded.keys()) {
+        if (!activeKeys.has(key)) {
+            peerUploaded.delete(key)
+        }
+    }
+}
+
+function isBlocked(ip) {
+    const expiresAt = blocked_ips.get(ip)
+    if (!expiresAt) {
+        return false
+    }
+    if (expiresAt <= Date.now()) {
+        blocked_ips.delete(ip)
+        return false
+    }
+    return true
+}
+
+function rememberBlocked(ip) {
+    blocked_ips.set(ip, Date.now() + config.timeout * 1000)
+}
+
+function cleanupBlockedIps() {
+    for (const [ip, expiresAt] of blocked_ips.entries()) {
+        if (expiresAt <= Date.now()) {
+            blocked_ips.delete(ip)
+        }
+    }
+}
+
+function parseConfigLine(line) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) {
+        return null
+    }
+    const splitIndex = trimmed.indexOf('=')
+    if (splitIndex === -1) {
+        return null
+    }
+    return {
+        key: trimmed.slice(0, splitIndex).trim(),
+        value: trimmed.slice(splitIndex + 1).trim()
+    }
+}
+
+function applyPositiveIntegerConfig(name, value) {
+    const parsed = parsePositiveInteger(value, null)
+    if (parsed === null) {
+        honsole.warn(`${name}=${value} 不是有效正整数，已忽略`)
+        return
+    }
+    config[name] = parsed
+}
+
+function applyNoVerify(value) {
+    config.rpc_options.verify = !parseBoolean(value, true)
+}
+
+function readTlsMaterial(value, name) {
+    const input = String(value || '').trim()
+    if (!input) {
+        return input
+    }
+    if (fs.existsSync(input)) {
+        return fs.readFileSync(input)
+    }
+    if (input.length > 100 && /^[A-Za-z0-9+/=\r\n]+$/.test(input)) {
+        return Buffer.from(input, 'base64')
+    }
+    throw new Error(`${name} 指向的文件不存在，且不像 base64 内容: ${input}`)
+}
+
+function detectIpv6Enabled() {
+    try {
+        if (fs.existsSync('/sys/module/ipv6/parameters/disable')) {
+            return fs.readFileSync('/sys/module/ipv6/parameters/disable', 'utf8').trim() === '0'
+        }
+        return fs.existsSync('/proc/net/if_inet6')
+    } catch (error) {
+        honsole.dev(error)
+        return false
+    }
+}
+
+function isLocalHttpsRpcUrl(url) {
+    try {
+        const rpcUrl = new URL(url)
+        return rpcUrl.protocol === 'https:' && (rpcUrl.hostname === 'localhost' || rpcUrl.hostname.startsWith('127.') || rpcUrl.hostname === '::1')
+    } catch (error) {
+        throw new Error(`rpc url 格式不正确: ${url}`)
+    }
+}
+
+function hasIpset(ipsetSaveOutput, setName) {
+    return ipsetSaveOutput
+        .split('\n')
+        .some(line => line.trim().startsWith(`create ${setName} `))
+}
+
 async function cron() {
     cron_processing_flag = false
+    const activePeerKeys = new Set()
     try {
         let torrentInfo = []    // [gid] = [numPieces, pieceLength]
         let d = await r_rpc.post(config.rpc_url, {
@@ -89,7 +246,7 @@ async function cron() {
             id: Buffer.from(`aria2b-${+new Date()}`).toString('base64'), // 其实就是随机值了，形式无所谓，大概，所以之前版本把 uuid 包给砍了，不需要
             params: ['token:' + config.secret, ['gid', 'status']]
         })
-        await asyncForEach(d.data.result, async t => {
+        await asyncForEach(d.data.result || [], async t => {
             if (t.status == 'active') {
                 let d_torr = await r_rpc.post(config.rpc_url, {
                     jsonrpc: '2.0',
@@ -103,41 +260,44 @@ async function cron() {
                     id: Buffer.from(`aria2b-${+new Date()}`).toString('base64'),
                     params: [[{ 'methodName': 'aria2.getPeers', 'params': ['token:' + config.secret, t.gid] }]]
                 })
-                for(peer in d_peer.data.result[0][0]){
-                    //honsole.log(`remembering ${t.gid}`)
-                    torrentInfo[t.gid] = [t.gid, d_torr.data.result[0][0].numPieces, d_torr.data.result[0][0].pieceLength]
-                }
-                await asyncForEach(d_peer.data.result[0][0], async peer => {
+                const status = d_torr.data?.result?.[0]?.[0] || {}
+                const peers = d_peer.data?.result?.[0]?.[0] || []
+                torrentInfo[t.gid] = [t.gid, Number(status.numPieces) || 0, Number(status.pieceLength) || 1]
+                await asyncForEach(peers, async peer => {
+                    const stateKey = peerStateKey(peer, t.gid)
+                    activePeerKeys.add(stateKey)
                     let c = get_peer_name(decodePercentEncodedString(peer.peerId))
-                    let toBlock=0
+                    let toBlock = 0
                     let bitprogress = countOnes(peer.bitfield)
                     //printpeer(peer,c,torrentInfo[t.gid])
-                    if (!blocked_ips.includes(peer.ip)) {
-                        if (new RegExp('(' + config.block_keywords.join('|') + ')').test(c.origin)) toBlock = 1
+                    if (!isBlocked(peer.ip)) {
+                        if (keywordMatches(config.block_keywords, c.origin)) toBlock = 1
                         else {
-                            if (((config.noprogress_keywords.includes('Unknown') && c.client == 'unknown') || new RegExp('(' + config.noprogress_keywords.join('|') + ')').test(c.origin)) && peer.uploadSpeed > 1024 && bitprogress == 0){
+                            const isNoProgressTarget = (hasUnknownKeyword(config.noprogress_keywords) && c.client == 'unknown') || keywordMatches(config.noprogress_keywords, c.origin)
+                            if (isNoProgressTarget && Number(peer.uploadSpeed) > 1024 && bitprogress == 0){
                                 //初筛：(名称符合) && 上传速度大于1KiB && 进度为0
                                 //printpeer(peer,c,torrentInfo[t.gid])
-                                if (peerUploaded[[peer.peerId,t.gid,0]] == undefined) peerUploaded[[peer.peerId,t.gid,0]] = 0
-                                peerUploaded[[peer.peerId,t.gid,0]] += peer.uploadSpeed * scan_interval / 1000  //累加计算上传量
-                                let uploadPiece = peerUploaded[[peer.peerId,t.gid,0]] / torrentInfo[t.gid][1]   //以分片数量为单位
+                                const state = getPeerState(stateKey)
+                                state.uploaded += Number(peer.uploadSpeed) * scan_interval / 1000  //累加计算上传量
+                                let uploadPiece = state.uploaded / torrentInfo[t.gid][2]   //以分片数量为单位
                                 if ( uploadPiece > config.noprogress_piece){
                                     //上传量大于noprogress_piece后开始表演节目《老子数到十》
-                                    if(peerUploaded[[peer.peerId,t.gid,1]] == undefined) peerUploaded[[peer.peerId,t.gid,1]] = 0
-                                    if(bitprogress == 0 && peer.downloadSpeed == 0){
-                                        peerUploaded[[peer.peerId,t.gid,1]] += 1
-                                        if (peerUploaded[[peer.peerId,t.gid,1]] > config.noprogress_wait) {
-                                            honsole.log(`往 ${decodeClient(peer.peerId).substring(0, 16).padEnd(16, ' ')}（${peer.ip}）\t传输了 ${String(uploadPiece).substring(0,8)}\t个piece，但它声称进度 ${countOnes(peer.bitfield)}/${torrentInfo[t.gid][0]} ，累犯 ${peerUploaded[[peer.peerId,t.gid,1]]} 次，ban了`)
+                                    if(bitprogress == 0 && Number(peer.downloadSpeed) == 0){
+                                        state.wait += 1
+                                        if (state.wait > config.noprogress_wait) {
+                                            honsole.log(`往 ${decodeClient(peer.peerId).substring(0, 16).padEnd(16, ' ')}（${peer.ip}）\t传输了 ${String(uploadPiece).substring(0,8)}\t个piece，但它声称进度 ${countOnes(peer.bitfield)}/${torrentInfo[t.gid][1]} ，累犯 ${state.wait} 次，ban了`)
                                             toBlock = 1
                                         }
                                     }
                                     else{
-                                        peerUploaded[[peer.peerId,t.gid,1]] = 0
+                                        state.wait = 0
                                     }
                                 }
+                            } else {
+                                peerUploaded.delete(stateKey)
                             }
                         }
-                        if ((config.block_keywords.includes('Unknown') || toBlock == 1) && c.client == 'unknown') {
+                        if ((hasUnknownKeyword(config.block_keywords) || toBlock == 1) && c.client == 'unknown') {
                             //这里比较偷懒所以尽可能直接用了huggy的代码，但逻辑好像似乎应该是没有漏洞的
                             await block_ip(peer.ip, {
                                 origin: 'Unknown',
@@ -154,8 +314,11 @@ async function cron() {
     } catch (e) {
         console.error('请求错误 日志如下，请检查是否填错 url 和 secret，也有可能是 aria2 进程嗝屁了，或者你的硬盘负载太大已经出现了 I/O hang 的情况。')
         console.error(e)
+    } finally {
+        cleanupPeerUploaded(activePeerKeys)
+        cleanupBlockedIps()
+        cron_processing_flag = true
     }
-    cron_processing_flag = true
 }
 // 初始化函数，载入配置之类的
 // 包装成匿名函数也行，不过会有 ;
@@ -194,31 +357,9 @@ https://github.com/makeding/aria2b`)
         console.log(`aria2b v${require('./package.json').version} by huggy`)
         process.exit(0)
     }
-    // 这里考虑到有些用户可能在 /etc/sudoers 放行了 ipset 所以这里不再判断是不是有权限用户
-    // ~~其实是懒，因为下面运行不成功会报错，大概不需要这一句~~
-    // if (await exec('whoami') !== 'root') {
-    //     console.log('[aria2b] 您似乎不是 root 用户 运行的')
-    //     process.exit(0)
-    // }
-    // 检查 ipset 配置，如果没有就安排
-    let ipset_save = await exec('ipset save')
-    if (argv.flush || !ipset_save.stdout.includes('bt_blacklist')) {
-        await flush_iptables_ipset(4)
-    }
-    if ((argv.flush || !ipset_save.stdout.includes('bt_blacklist6'))) {
-        await flush_iptables_ipset(6)
-    }
-    // blocked_ips
-    // ipset_save.stdout.split('\n').forEach(x => {
-    //     if (x.includes('bt_blacklist ')) {
-    //     }
-    // })
-    // 只刷新表就退出
-    if (argv.flush) {
-        process.exit(0)
-    }
     // 载入配置 开始
     // 从 aria2 配置文件自动载入
+    config.ipv6 = detectIpv6Enabled()
     let path = argv.c || argv.config || null
     if (!path) {
         if (fs.existsSync(`${process.env.HOME}/.aria2/aria2.conf`)) {
@@ -239,34 +380,45 @@ https://github.com/makeding/aria2b`)
         await load_config_from_aria2_file(path)
     }
     // cli 给的配置优先度最高
-    if (argv.u || argv.url) config.rpc_url = argv.u || argv['rpc-url']
+    if (argv.u || argv.url || argv['rpc-url'] || argv.rpcUrl) config.rpc_url = argv.u || argv.url || argv['rpc-url'] || argv.rpcUrl
     if (argv.s || argv.secret) config.secret = argv.s || argv.secret
-    if (argv.b || argv['block-keywords']) config.block_keywords = (argv.b || argv['block-keywords']).replace(/ /g, '').split(',')
-    if (argv['noprogress-keywords']) config.noprogress_keywords = (argv['noprogress-keywords']).replace(/ /g, '').split(',')
-    if (argv['noprogress-piece']) config.noprogress_piece = argv['noprogress-piece']
-    if (argv['noprogress-wait']) config.noprogress_wait = argv['noprogress-wait']
+    if (argv.b || argv['block-keywords']) config.block_keywords = parseList(argv.b || argv['block-keywords'])
+    if (argv['noprogress-keywords']) config.noprogress_keywords = parseList(argv['noprogress-keywords'])
+    if (argv['noprogress-piece'] !== undefined) applyPositiveIntegerConfig('noprogress_piece', argv['noprogress-piece'])
+    if (argv['noprogress-wait'] !== undefined) applyPositiveIntegerConfig('noprogress_wait', argv['noprogress-wait'])
+    if (argv.timeout !== undefined) applyPositiveIntegerConfig('timeout', argv.timeout)
     if (argv['rpc-ca']) config.rpc_options.ca = argv['rpc-ca']
     if (argv['rpc-cert']) config.rpc_options.cert = argv['rpc-cert']
     if (argv['rpc-key']) config.rpc_options.key = argv['rpc-key']
-    if (argv['rpc-no-verify']) config.rpc_options.verify = false;
+    if (argv['rpc-no-verify'] !== undefined) applyNoVerify(argv['rpc-no-verify'])
     ['ca', 'cert', 'key'].forEach(x => {
         if (config.rpc_options[x]) {
-            if (config.rpc_options[x].length > 100) {
-                config.rpc_options[x] = Buffer.from(config.rpc_options[x], 'base64')
-            } else {
-                config.rpc_options[x] = fs.readFileSync(config.rpc_options[x])
-            }
+            config.rpc_options[x] = readTlsMaterial(config.rpc_options[x], `rpc-${x}`)
         }
     })
     // rpc 为 localhost 默认禁用验证
     // 一个冷知识 127.0.0.1/8 都是 loopback
-    if (config.rpc_url.startsWith('https://127') || config.rpc_url.startsWith('https://localhost')) {
+    if (isLocalHttpsRpcUrl(config.rpc_url)) {
         config.rpc_options.verify = false
     }
     config.rpc_options.rejectUnauthorized = config.rpc_options.verify
     delete config.rpc_options.verify
     r_rpc.defaults.httpsAgent = new https.Agent(config.rpc_options)
     // 载入配置 完毕
+    // 这里考虑到有些用户可能在 /etc/sudoers 放行了 ipset 所以这里不再判断是不是有权限用户
+    // ~~其实是懒，因为下面运行不成功会报错，大概不需要这一句~~
+    // 检查 ipset 配置，如果没有就安排
+    let ipset_save = await execFile('ipset', ['save'])
+    if (argv.flush || !hasIpset(ipset_save.stdout, 'bt_blacklist')) {
+        await flush_iptables_ipset(4)
+    }
+    if (config.ipv6 && (argv.flush || !hasIpset(ipset_save.stdout, 'bt_blacklist6'))) {
+        await flush_iptables_ipset(6)
+    }
+    // 只刷新表就退出
+    if (argv.flush) {
+        process.exit(0)
+    }
     honsole.log(`${config.rpc_url} secret: ${config.secret.split('').map((x, i) => (i === 0 || i === config.secret.length - 1) ? x : '*').join('')} `)
     honsole.log(`屏蔽客户端列表：${config.block_keywords.join(', ')}`)
     honsole.logt('started!')
@@ -278,7 +430,11 @@ https://github.com/makeding/aria2b`)
     cron()
 }
 const scan_interval = 5000 // 频率，自己改改，个人感觉不需要太频繁，反正最多被偷一点点流量。单位毫秒
-initial()
+initial().catch(error => {
+    honsole.error('启动失败')
+    honsole.error(error)
+    process.exit(1)
+})
 /**
  * 从 aria2 配置文件读取配置
  * （写法有点奇妙，可能会有问题）
@@ -288,62 +444,59 @@ async function load_config_from_aria2_file(path) {
     let ssl = false
     let port = 6800
     try {
-        // ipv6 支持情况，比较粗暴，不过应该够用了
-        let ipv6_status = await exec('cat /sys/module/ipv6/parameters/disable')
-        if (ipv6_status.stdout === '0') {
-            config.ipv6 = true
-        }
-        //          读文件       转文本       去掉空格（有点暴力，可能会出事）
-        //                               没有用 replaceAll 怕目标机器 nodejs 版本太老
-        fs.readFileSync(path).toString().replace(/ /g, '').split('\n').forEach(x => {
-            const value = x.split('=')[1]
-            if (x.startsWith('rpc-secret=')) {
+        fs.readFileSync(path).toString().split('\n').forEach(line => {
+            const parsed = parseConfigLine(line)
+            if (!parsed) {
+                return
+            }
+            const { key, value } = parsed
+            if (key === 'rpc-secret') {
                 config.secret = value
             }
-            if (x.startsWith('rpc-listen-port=')) {
+            if (key === 'rpc-listen-port') {
                 port = value
             }
-            if (x.startsWith('rpc-secure=true')) {
-                ssl = true
+            if (key === 'rpc-secure') {
+                ssl = parseBoolean(value, false)
             }
-            if (x.startsWith('disable-ipv6=true')) {
-                config.ipv6 = false
+            if (key === 'disable-ipv6') {
+                config.ipv6 = !parseBoolean(value, false)
             }
-            if (x.startsWith('ab-bt-ban-client-keywords')) {
-                config.block_keywords = value.split(',')
+            if (key === 'ab-bt-ban-client-keywords') {
+                config.block_keywords = parseList(value)
             }
-            if (x.startsWith('ab-bt-noprogress-keywords')) {
-                config.noprogress_keywords = value.split(',')
+            if (key === 'ab-bt-noprogress-keywords') {
+                config.noprogress_keywords = parseList(value)
             }
-            if (x.startsWith('ab-bt-noprogress-piece')) {
-                config.noprogress_piece = value
+            if (key === 'ab-bt-noprogress-piece') {
+                applyPositiveIntegerConfig('noprogress_piece', value)
             }
-            if (x.startsWith('ab-bt-noprogress-wait')) {
-                config.noprogress_wait = value
+            if (key === 'ab-bt-noprogress-wait') {
+                applyPositiveIntegerConfig('noprogress_wait', value)
             }
             // 信任自签 CA 证书
-            if (x.startsWith('ab-rpc-ca')) {
+            if (key === 'ab-rpc-ca') {
                 config.rpc_options.ca = value
             }
             // 信任自签 cert 证书
-            if (x.startsWith('ab-rpc-cert')) {
+            if (key === 'ab-rpc-cert') {
                 config.rpc_options.cert = value
             }
             // 信任需要 key 也提供
             // 查看更多： https://nodejs.org/api/tls.html （cert）
-            if (x.startsWith('ab-rpc-key')) {
+            if (key === 'ab-rpc-key') {
                 config.rpc_options.key = value
             }
             // 忽略证书校验
-            if (x.startsWith('ab-rpc-no-verify')) {
-                config.rpc_options.verify = false
+            if (key === 'ab-rpc-no-verify') {
+                applyNoVerify(value)
             }
-            if (x.startsWith('ab-bt-ban-timeout')) {
-                config.timeout = value
+            if (key === 'ab-bt-ban-timeout') {
+                applyPositiveIntegerConfig('timeout', value)
             }
-            // 都本地读取文件了，说明这边大概是 127.0.0.1 ¿
-            config.rpc_url = `http${ssl ? 's' : ''}://127.0.0.1:${port}/jsonrpc`
         })
+        // 都本地读取文件了，说明这边大概是 127.0.0.1 ¿
+        config.rpc_url = `http${ssl ? 's' : ''}://127.0.0.1:${port}/jsonrpc`
         honsole.log(`读取配置文件(${path})成功`)
     } catch (error) {
         honsole.error(`读取配置文件(${path})失败，请检查配置文件路径以及格式是否正确`)
@@ -355,19 +508,17 @@ async function load_config_from_aria2_file(path) {
  */
 async function flush_iptables_ipset(ipversion = 4) {
     // 检查 ipset 配置，如果没有就安排
-    if (ipversion == 4) {
-        ipversion = ''
-    } else {
-        ipversion = '6'
-    }
+    const suffix = ipversion == 6 ? '6' : ''
+    const iptables = ipversion == 6 ? 'ip6tables' : 'iptables'
+    const setName = `bt_blacklist${suffix}`
     try {
         // 感觉还不如 if else ....
-        await execR(`ip${ipversion}tables -D INPUT -m set --match-set bt_blacklist${ipversion} src -j DROP`)
-        await execR(`ipset destroy bt_blacklist${ipversion}`)
-        await exec(`ipset create bt_blacklist${ipversion} hash:ip timeout 600${ipversion === '6' ? ' family inet6' : ''}`) // default 10min = 600s
-        await exec(`ip${ipversion}tables -I INPUT -m set --match-set bt_blacklist${ipversion} src -j DROP`)
+        await execFileR(iptables, ['-D', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP'])
+        await execFileR('ipset', ['destroy', setName])
+        await execFile('ipset', ['create', setName, 'hash:ip', 'timeout', '600'].concat(ipversion == 6 ? ['family', 'inet6'] : [])) // default 10min = 600s
+        await execFile(iptables, ['-I', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP'])
         if (argv.flush) {
-            honsole.log(`清空 bt_blacklist${ipversion} 规则成功`)
+            honsole.log(`清空 ${setName} 规则成功`)
         }
     } catch (error) {
         honsole.error(error)
@@ -380,17 +531,27 @@ async function flush_iptables_ipset(ipversion = 4) {
 }
 async function block_ip(ip, c) {
     // ipv6 
+    const ipVersion = net.isIP(ip)
+    if (!ipVersion) {
+        honsole.warn('跳过无效 IP:', ip)
+        return
+    }
+    if (ipVersion === 6 && !config.ipv6) {
+        honsole.dev('IPv6 已禁用，跳过:', ip)
+        return
+    }
+    config.timeout = parsePositiveInteger(config.timeout, 86400)
+    const setName = ipVersion === 6 ? 'bt_blacklist6' : 'bt_blacklist'
     try {
         // 可能需要 ban 段，不过一般不会有这种情况。
-        if (ip.includes(':')) {
-            await exec(`ipset add bt_blacklist6 ${ip} timeout ${config.timeout}`)
-        } else {
-            await exec(`ipset add bt_blacklist ${ip} timeout ${config.timeout}`)
-        }
+        await execFile('ipset', ['add', setName, ip, 'timeout', String(config.timeout)])
+        rememberBlocked(ip)
         honsole.logt('Blocked:', ip, c.origin, c.client, c.version)
     } catch (error) {
         // if(!error.stderr.includes('already added')){
-        if (!JSON.stringify(error).includes('already added')) {
+        if (JSON.stringify(error).includes('already added')) {
+            rememberBlocked(ip)
+        } else {
             console.warn(error)
         }
     }

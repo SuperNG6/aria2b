@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release (vX.Y.Z or X.Y.Z)
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: npm-shrinkwrap.json
+      - name: Install
+        run: npm ci
+      - name: Check syntax
+        run: |
+          node --check app.js
+          node --check common.js
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ "$tag" != v* ]]; then
+            tag="v$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Verify version
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          tag_version="${tag#v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$tag_version" != "$pkg" ]; then
+            echo "Tag $tag does not match package.json version $pkg"
+            exit 1
+          fi
+      - name: Build release assets
+        run: |
+          mkdir -p dist
+          cp app.js dist/aria2b
+          chmod +x dist/aria2b
+          npm pack --silent
+          sha256sum dist/aria2b > dist/aria2b.sha256
+          sha256sum aria2b-*.tgz > dist/aria2b.tgz.sha256
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          gh release create "$tag" \
+            dist/aria2b \
+            aria2b-*.tgz \
+            dist/*.sha256 \
+            --title "$tag" \
+            --generate-notes

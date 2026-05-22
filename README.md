@@ -25,8 +25,10 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
   
 > **_注：_** 此处使用扫描时的瞬时速度当作扫描间隔里的平均速度，统计对每个peer的上传量（因为没找到aria2c RPC怎么获取现成/精确的每个peer的上传量，transmission倒是有）
 ## 依赖
-`nodejs` `ipset` `iptables`  
+`Node.js 24 LTS` `ipset` `iptables`
 自行参考[Node.js 官方教程](https://github.com/nodesource/distributions/blob/master/README.md)  
+
+Docker 内运行时需要容器具备 `NET_ADMIN` 能力来操作 `ipset` / `iptables`，不建议使用 `--privileged`。
 
 开机自动启动 `ipset` `iptables` 按照自己需求来安排
 ### Alpine
@@ -66,6 +68,17 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
     node app.js
 
     git pull # 更新
+
+## GitHub Actions / gh CLI
+
+使用 GitHub CLI 触发构建与测试：
+
+    gh workflow run ci.yml
+    gh run watch
+
+发布 release：
+
+    gh workflow run release.yml -f tag=vX.Y.Z
 ## 配置
 目前版本已经默认开箱即用了，欢迎报告 bug  
 * 使用aria2的配置文件
