@@ -8,7 +8,12 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Alpine 3.23 自带 22；额外测 24 LTS，覆盖 npm 全局安装场景
+        node: ['22', '24']
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -16,12 +21,16 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: npm-shrinkwrap.json
       - name: Install
         run: npm ci
-      - name: Check syntax
+      - name: Syntax check
+        run: node --check app.js
+      - name: Unit & integration tests
+        run: node --test --test-reporter=spec 'test/*.test.js'
+      - name: CLI smoke test (-h / -v)
         run: |
-          node --check app.js
-          node --check common.js
+          node app.js -h
+          node app.js -v

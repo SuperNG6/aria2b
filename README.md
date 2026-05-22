@@ -25,7 +25,7 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
   
 > **_注：_** 此处使用扫描时的瞬时速度当作扫描间隔里的平均速度，统计对每个peer的上传量（因为没找到aria2c RPC怎么获取现成/精确的每个peer的上传量，transmission倒是有）
 ## 依赖
-`Node.js 24 LTS` `ipset` `iptables`
+`Node.js >= 22` `ipset` `iptables`
 自行参考[Node.js 官方教程](https://github.com/nodesource/distributions/blob/master/README.md)  
 
 Docker 内运行时需要容器具备 `NET_ADMIN` 能力来操作 `ipset` / `iptables`，不建议使用 `--privileged`。
@@ -37,7 +37,7 @@ Docker 内运行时需要容器具备 `NET_ADMIN` 能力来操作 `ipset` / `ipt
 ### Ubuntu / Debian
     apt-get install ipset
 ### ArchLinux
-    pacman -S ipset yarn
+    pacman -S ipset
 
 ### Centos
     yum install ipset
@@ -48,11 +48,9 @@ Docker 内运行时需要容器具备 `NET_ADMIN` 能力来操作 `ipset` / `ipt
 > 同时也是更新命令
 
     npm i -g aria2b
-    # 或者
-    yarn global add aria2b
     aria2b
 ### 稳定版但是单文件
-> 适合 OpenWrt 或者不想使用包管理器的你
+> 适合 OpenWrt / Docker 单文件部署或者不想使用包管理器的你
 
 到 [releases](https://github.com/makeding/aria2b/releases) 下载最新版本
 
@@ -63,11 +61,11 @@ Docker 内运行时需要容器具备 `NET_ADMIN` 能力来操作 `ipset` / `ipt
 
     git clone https://github.com/makeding/aria2b.git # 克隆
     cd aria2b
-    yarn # 安装依赖
-    # npm install # 也是安装依赖
+    npm install        # 安装依赖
     node app.js
 
-    git pull # 更新
+    npm test           # 运行测试
+    git pull           # 更新
 
 ## GitHub Actions / gh CLI
 
@@ -99,16 +97,21 @@ aria2b支持寄生配置。会读取aria2本体的配置文件来找 aria2 RPC �
 | 描述 | cli |  aria2 config 寄生配置  | 默认值 | 备注
 |-|-|-|-|-|
 | rpc url | -u --url | N/A | http://127.0.0.1:6800/jsonrpc 
-| rpc secret | -s --secret | ab-rpc-secret | N/A
-| ban 客户端关键字 | -b --block-keywords | ab-bt-ban-client-keywords | XL,SD,XF,QN,BD | 以,为分割符
-| 需监视进度的客户端关键字 | --noprogress-keywords | ab-bt-noprogress-keywords | XL,SD,XF,QN,BD,Unknown | 以,为分割符
+| rpc secret | -s --secret | rpc-secret | N/A | 与 aria2 共享同一字段
+| ban 客户端关键字 | -b --block-keywords | ab-bt-ban-client-keywords | XL,SD,XF,QD,BN | 以,为分割符
+| 需监视进度的客户端关键字 | --noprogress-keywords | ab-bt-noprogress-keywords | XL,SD,XF,QD,BN,Unknown | 以,为分割符
 | 进度阈值 | --noprogress-piece| ab-bt-noprogress-piece | 5 | 单位：种子的分片数
 | 超过阈值等待次数 | --noprogress-wait | ab-bt-noprogress-wait | 10 |
-| IP 解除封禁时间 | --timeout | ab-bt-ban-timeout | 86400 | 以秒来计算
-| 关闭证书校验 | --rpc-no-verify | ab-rpc-no-verify| N/A | rpc 为本地时默认关闭证书校验 
+| 扫描间隔 | --scan-interval | ab-bt-scan-interval | 5000 | 单位毫秒，范围 1000~60000
+| IP 解除封禁时间 | --timeout | ab-bt-ban-timeout | 86400 | 单位秒
+| 关闭证书校验 | --rpc-no-verify | ab-rpc-no-verify| N/A | rpc 为本地 https 时默认关闭证书校验
 | 自定义信任ca证书 | --rpc-ca | ab-rpc-ca | N/A | 路径/base64两次编码
 | 自定义信任证书 | --rpc-cert | ab-rpc-cert | N/A | 路径/base64两次编码
 | 自定义信任私钥 | --rpc-key | ab-rpc-key | N/A | 路径/base64两次编码
+
+环境变量：
+- `DEV=1` 输出 debug 日志
+- `HIDE_TIME_PREFIX=1` 日志不带时间前缀（外部 logger/journalctl 通常自己加时间，避免重复）
 
 > **_注意：_** ⚠️寄生配置**不**支持结尾带 # 注释
 

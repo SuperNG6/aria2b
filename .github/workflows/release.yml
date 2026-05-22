@@ -22,15 +22,15 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: npm
           cache-dependency-path: npm-shrinkwrap.json
       - name: Install
         run: npm ci
-      - name: Check syntax
-        run: |
-          node --check app.js
-          node --check common.js
+      - name: Syntax check
+        run: node --check app.js
+      - name: Run tests
+        run: node --test 'test/*.test.js'
       - name: Resolve tag
         id: tag
         run: |
@@ -52,11 +52,32 @@ jobs:
             echo "Tag $tag does not match package.json version $pkg"
             exit 1
           fi
-      - name: Build release assets
+      - name: Build single-file bundle
         run: |
           mkdir -p dist
-          cp app.js dist/aria2b
+          ver="${{ steps.tag.outputs.tag }}"
+          ver="${ver#v}"
+
+          # 在 app.js 中预先注入版本号（替换 'standalone' 字面量）
+          sed -i "s/^let VERSION = 'standalone'/let VERSION = '${ver}'/" app.js
+          grep -q "let VERSION = '${ver}'" app.js || { echo "version injection failed"; exit 1; }
+
+          # 用 esbuild 把所有 npm 依赖 bundle 进单文件（shebang 由 app.js 头部自带）。
+          # 这样 docker-aria2 等场景下 curl 下来的 aria2b 不需要 node_modules 即可运行。
+          npx --yes esbuild@0.27.1 app.js \
+            --bundle --platform=node --target=node22 \
+            --format=cjs --legal-comments=none \
+            --outfile=dist/aria2b
           chmod +x dist/aria2b
+
+          # 自检：单文件版能在不依赖 node_modules 的环境下跑起来
+          # （cd 到 /tmp 避免意外解析到项目里的 node_modules）
+          rm -rf /tmp/aria2b-selfcheck && mkdir /tmp/aria2b-selfcheck
+          cp dist/aria2b /tmp/aria2b-selfcheck/aria2b
+          (cd /tmp/aria2b-selfcheck && node aria2b -v)
+          (cd /tmp/aria2b-selfcheck && node aria2b -h > /dev/null)
+
+          # npm tarball（供 npm 全局安装的用户）
           npm pack --silent
           sha256sum dist/aria2b > dist/aria2b.sha256
           sha256sum aria2b-*.tgz > dist/aria2b.tgz.sha256

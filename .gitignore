@@ -1,6 +1,5 @@
 node_modules
 config.js
-*test*
 *tmp*
 .DS_Store
 dist
