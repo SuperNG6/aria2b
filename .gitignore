@@ -3,3 +3,4 @@ config.js
 *tmp*
 .DS_Store
 dist
+*.torrent

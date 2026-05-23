@@ -192,15 +192,10 @@ function readTlsMaterial(value, name) {
 }
 
 function detectIpv6Enabled() {
-    try {
-        if (fs.existsSync('/sys/module/ipv6/parameters/disable')) {
-            return fs.readFileSync('/sys/module/ipv6/parameters/disable', 'utf8').trim() === '0'
-        }
-        return fs.existsSync('/proc/net/if_inet6')
-    } catch (e) {
-        honsole.dev('detectIpv6Enabled:', e)
-        return false
-    }
+    // /proc/net/if_inet6 是 per-netns 的：容器内禁用 IPv6（--sysctl net.ipv6.conf.all.disable_ipv6=1
+    // 或 boot-time `ipv6.disable=1`）时内核根本不创建这个文件，否则一定存在。
+    // 只看这一个信号源就够了 —— docker alpine 上行为稳定。
+    return fs.existsSync('/proc/net/if_inet6')
 }
 
 function isLocalHttpsRpcUrl(url) {
@@ -394,9 +389,12 @@ function httpJsonPost(opts, url, body) {
             res.on('error', reject)
         })
 
-        // 绝对超时：用外层 setTimeout 包整个请求，覆盖 connect 阶段。
+        // 绝对超时：用外层 setTimeout 包整个请求，覆盖 connect / headers / body 全阶段。
         // 不能只用 req.setTimeout —— 那只是 socket 分配后才生效，
         // connect 卡住时会被 TCP 内核默认的 ~2 分钟超时拖死。
+        // 也不能在 'response' 一到就清超时 —— 服务器可能只回 headers 然后 hang 住不发 body
+        // （aria2 内部死锁 / 慢速 attack / 中间链路故障），那样会卡死整个 cron。
+        // 只在请求结束（'close' / 'error'）时清，让超时覆盖到 body 收完为止。
         // 用 ECONNABORTED 对齐 axios 风格，sanitizeError 不用改。
         let absoluteTimer = null
         const clearAbsoluteTimer = () => {
@@ -409,7 +407,6 @@ function httpJsonPost(opts, url, body) {
                 req.destroy(err)
             }, opts.timeout)
         }
-        req.on('response', clearAbsoluteTimer)
         req.on('error', (err) => { clearAbsoluteTimer(); reject(err) })
         req.on('close', clearAbsoluteTimer)
         req.end(payload)
@@ -503,11 +500,37 @@ async function flushIptablesIpset(version) {
 }
 
 /**
+ * 幂等地确保 iptables INPUT 链中存在引用本 set 的 DROP 规则。
+ *
+ * 自愈场景：前次启动如果在 `ipset create` 后、`iptables -I` 前被 SIGKILL 打断，
+ * 重启时 hasIpset() 返回 true → 跳过 flushIptablesIpset() → 规则永远不被装上，
+ * 整个 aria2b 跑得欢快但实际上一个 IP 都拦不住。`iptables -C` 检查规则是否存在，
+ * 不存在则补 `-I`。docker alpine 上 -C 是标准选项，行为稳定。
+ */
+async function ensureIptablesRule(version) {
+    const iptables = version === 6 ? 'ip6tables' : 'iptables'
+    const setName = version === 6 ? IPSET_NAME_V6 : IPSET_NAME_V4
+    const ruleArgs = ['INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP']
+    try {
+        await runtime.execFile(iptables, ['-C', ...ruleArgs])
+        return false   // 已存在，无需补装
+    } catch (_) {
+        // -C 在规则不存在时退出码非 0；这是预期分支，继续补装
+    }
+    await runtime.execFile(iptables, ['-I', ...ruleArgs])
+    honsole.log(`已补装 ${iptables} 规则（${setName} 引用，前次启动可能被中断）`)
+    return true
+}
+
+/**
  * 从 `ipset save` 输出中把已存在的 IP 同步到本地缓存。
  * 进程重启后避免对已封 IP 再次 `ipset add`，减少子进程开销与日志噪音。
  */
-function syncBlockedIpsFromIpset(saveOutput) {
+function syncBlockedIpsFromIpset(saveOutput, allowedSets) {
     if (!saveOutput) return 0
+    // 默认 sync 两个 set；调用方可传子集（例如某个 set 刚被 flush，就不要同步它的旧条目，
+    // 否则缓存说"已封"但 ipset 已空，cron 会因 isBlocked=true 跳过这些 peer → 实际未拦截。）
+    const sets = allowedSets || [IPSET_NAME_V4, IPSET_NAME_V6]
     let count = 0
     for (const line of saveOutput.split('\n')) {
         const t = line.trim()
@@ -515,7 +538,7 @@ function syncBlockedIpsFromIpset(saveOutput) {
         const parts = t.split(/\s+/)
         if (parts.length < 3) continue
         const setName = parts[1]
-        if (setName !== IPSET_NAME_V4 && setName !== IPSET_NAME_V6) continue
+        if (!sets.includes(setName)) continue
         const ip = parts[2]
         if (!net.isIP(ip)) continue
         const idx = parts.indexOf('timeout')
@@ -604,6 +627,12 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
     } else {
         banQueue.push({ ip: peer.ip, info: c })
     }
+    // 进入 banQueue 即清状态机：
+    // 1) 成功 ban → rememberBlocked 后下次 isBlocked 拦截，state 本来也会被 cleanupPeerState 清。
+    // 2) blockIp 失败（ipset 临时故障）→ rememberBlocked 不会被调用，旧版会让下次扫描
+    //    因 wait 仍 > 阈值而立刻再次进 banQueue，每次扫描重复打 "传输了 X 个 piece" + 'ipset add 失败'。
+    //    清掉 state 给重试一个 noprogress_wait 次的回退窗口，节制日志的同时也避免基于陈旧累计的误判。
+    peerState.delete(stateKey)
 }
 
 async function cron() {
@@ -837,7 +866,10 @@ function applyCliConfig() {
 }
 
 function helpText() {
-    const name = process.argv0 === 'node' ? 'node app.js' : 'aria2b'
+    // process.argv0 在 shebang 启动时始终是 'node'（包括 npm i -g 后用 `aria2b` 命令调用）。
+    // 用 process.argv[1] 判断更可靠：'/usr/local/bin/aria2b' 或单文件 bundle 路径都以 'aria2b' 结尾。
+    const arg1 = process.argv[1] || ''
+    const name = /(?:^|[\\/])aria2b$/.test(arg1) ? 'aria2b' : 'node app.js'
     const pad = ' '.repeat(name.length + 1)
     return `aria2b v${VERSION} by huggy
 
@@ -910,6 +942,13 @@ async function initial() {
     if (argv.help)    { console.log(helpText()); return }
     if (argv.version) { console.log(`aria2b v${VERSION} by huggy`); return }
 
+    // 信号处理器要在第一个 await 之前装好。
+    // initial() 中后续会 await ipset save / flushIptablesIpset 等子进程，
+    // 这些 await 期间如果没有 handler，docker stop 会用 default SIGTERM 直接 kill 进程，
+    // 可能让 ipset 处于半初始化状态（destroy 完成但 create 还没跑 / 规则未装）。
+    // stop() 引用的所有全局对象（scanTimer/rpcClient/cronInflight）都是 null-safe。
+    installSignalHandlers()
+
     config.ipv6 = detectIpv6Enabled()
 
     const cfgPath = argv.config || findAria2Config()
@@ -930,23 +969,40 @@ async function initial() {
         process.exit(1)
     }
 
+    let v4Flushed = false
+    let v6Flushed = false
     if (argv.flush || !hasIpset(ipsetSave, IPSET_NAME_V4)) {
         await flushIptablesIpset(4)
+        v4Flushed = true
+    } else {
+        // set 已存在 → 跳过 flush 保留已封 IP，但仍需幂等检查 iptables 规则在不在，
+        // 防止前次启动被打断后规则缺失、aria2b 跑空转。
+        await ensureIptablesRule(4)
     }
-    if (config.ipv6 && (argv.flush || !hasIpset(ipsetSave, IPSET_NAME_V6))) {
-        await flushIptablesIpset(6)
+    if (config.ipv6) {
+        if (argv.flush || !hasIpset(ipsetSave, IPSET_NAME_V6)) {
+            await flushIptablesIpset(6)
+            v6Flushed = true
+        } else {
+            await ensureIptablesRule(6)
+        }
     }
     if (argv.flush) {
         honsole.log('已清空 ipset/iptables 规则')
         return
     }
 
-    // 启动时把 ipset 中已存在的 IP 同步进本地缓存
-    try {
-        const r = await runtime.execFile('ipset', ['save'])
-        const synced = syncBlockedIpsFromIpset(r.stdout || '')
+    // 启动时把 ipset 中已存在的 IP 同步进本地缓存。
+    // 刚被 flush 的 set 实际是空的，绝不能从 flush 前的快照里同步它的旧条目 ——
+    // 否则缓存里"已封"但 ipset 中没有，cron 会因 isBlocked=true 跳过这些 peer，
+    // 它们就永远拦不住了。只 sync 没被 flush 的 set。复用上面已有的 ipsetSave 快照，省一次 fork。
+    const syncTargets = []
+    if (!v4Flushed) syncTargets.push(IPSET_NAME_V4)
+    if (!v6Flushed && config.ipv6) syncTargets.push(IPSET_NAME_V6)
+    if (syncTargets.length > 0) {
+        const synced = syncBlockedIpsFromIpset(ipsetSave, syncTargets)
         if (synced > 0) honsole.log(`已从 ipset 同步 ${synced} 个已封禁 IP 到本地缓存`)
-    } catch (_) { /* 同步失败不致命 */ }
+    }
 
     honsole.log(`${config.rpc_url} secret: ${maskSecret(config.secret)}`)
     honsole.log(`屏蔽客户端：${config.block_keywords.join(', ')}`)
@@ -954,7 +1010,6 @@ async function initial() {
     honsole.log(`扫描间隔 ${config.scan_interval}ms，封禁时长 ${config.timeout}s，IPv6 ${config.ipv6 ? '启用' : '禁用'}`)
     honsole.logt('started!')
 
-    installSignalHandlers()
     runLoop()
 }
 
@@ -985,7 +1040,7 @@ module.exports = {
         // CLI
         parseArgv, applyCliConfig, applyNoVerify, loadConfigFromAria2File,
         // ipset / iptables
-        flushIptablesIpset, blockIp,
+        flushIptablesIpset, ensureIptablesRule, blockIp,
         // RPC
         httpJsonPost,
         // cron

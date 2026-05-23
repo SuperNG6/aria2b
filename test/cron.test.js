@@ -437,6 +437,79 @@ test('cron: tellActive 返回空 → 不调 multicall、不 ban', async (t) => {
     assert.equal(_internal._getFailures(), 0, '空任务不是失败')
 })
 
+// ---------- cron: ban 后清状态 → ipset 故障时不刷屏 + 不基于陈旧累计误判 ----------
+
+test('cron: ban 触发即清 peerState（避免 ipset 故障时重复刷屏 ban）', async (t) => {
+    _reset()
+    config.noprogress_keywords = ['XL']
+    config.block_keywords = ['NEVER_MATCH']
+    config.noprogress_piece = 1
+    config.noprogress_wait = 2
+    config.scan_interval = 1000
+
+    const mock = await startMockAria2((req) => {
+        if (req.method === 'aria2.tellActive') return { result: [{ gid: 'g' }] }
+        if (req.method === 'system.multicall') {
+            const calls = req.params[0]
+            const results = calls.map(c => {
+                if (c.methodName === 'aria2.tellStatus') return [{ numPieces: 10, pieceLength: 1024 }]
+                if (c.methodName === 'aria2.getPeers') return [[
+                    {
+                        peerId: '%2DXL0012%2Dabcdef012345',
+                        ip: '203.0.113.50',
+                        uploadSpeed: 10240,
+                        downloadSpeed: 0,
+                        bitfield: '00'
+                    }
+                ]]
+                return [null]
+            })
+            return { result: results }
+        }
+        return { result: [] }
+    })
+    t.after(() => mock.close())
+
+    config.rpc_url = mock.url
+    _setRpcClient(_makeRpcClient())
+
+    // 让 ipset add 始终失败 —— 模拟 ipset 临时故障
+    const original = runtime.execFile
+    let ipsetAdds = 0
+    runtime.execFile = async (file, args) => {
+        if (file === 'ipset' && args[0] === 'add') {
+            ipsetAdds++
+            throw Object.assign(new Error('ipset busy'), { code: 1 })
+        }
+        return { stdout: '', stderr: '' }
+    }
+    t.after(() => { runtime.execFile = original })
+
+    // 第 1 轮：wait += 1 = 1，未达阈值
+    await cron()
+    assert.equal(ipsetAdds, 0)
+    let s = [...peerState.values()][0]
+    assert.equal(s && s.wait, 1)
+
+    // 第 2 轮：wait += 1 = 2，未达阈值（阈值是 > 2）
+    await cron()
+    s = [...peerState.values()][0]
+    assert.equal(s && s.wait, 2)
+    assert.equal(ipsetAdds, 0)
+
+    // 第 3 轮：wait += 1 = 3，超过阈值 → 触发 ban（ipset add 失败）→ state 被清
+    await cron()
+    assert.equal(ipsetAdds, 1, '第 3 轮应触发一次 ipset add')
+    assert.equal(peerState.size, 0,
+        'ban 触发后 peerState 必须被清空，否则下次扫描 wait 仍 > 阈值会立刻再次 ban')
+
+    // 第 4 轮：从零累计，wait 应为 1（重置后又涨了一格），仍不应再 ban
+    await cron()
+    assert.equal(ipsetAdds, 1, '第 4 轮：state 已清空，wait 重新从 0 累计 → 这一轮不应再次 ban')
+    s = [...peerState.values()][0]
+    assert.equal(s && s.wait, 1, 'wait 应该被重置后重新累计')
+})
+
 // ---------- backoffDelay ----------
 
 test('backoffDelay: 成功时 = scan_interval，失败时指数退避到上限', () => {

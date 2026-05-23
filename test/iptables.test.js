@@ -12,7 +12,7 @@ const { _internal } = require('../app.js')
 
 const {
     config, blockedIps, runtime,
-    flushIptablesIpset, blockIp,
+    flushIptablesIpset, ensureIptablesRule, blockIp,
     isBlocked,
     _reset
 } = _internal
@@ -193,6 +193,66 @@ test('blockIp: 无效 IP 字符串直接跳过', async (t) => {
 
     assert.equal(spy.calls.length, 0)
 })
+
+// ---------- ensureIptablesRule: 自愈 ----------
+
+test('ensureIptablesRule(4): 规则不存在时补装 iptables -I', async (t) => {
+    // -C 失败 → 规则不存在 → 应补 -I
+    const calls = []
+    const original = runtime.execFile
+    runtime.execFile = async (file, args) => {
+        calls.push({ file, args: [...args] })
+        if (args[0] === '-C') throw Object.assign(new Error('No chain/target/match'), { code: 1 })
+        return { stdout: '', stderr: '' }
+    }
+    t.after(() => { runtime.execFile = original })
+
+    const inserted = await ensureIptablesRule(4)
+    assert.equal(inserted, true)
+
+    const check = calls.find(c => c.file === 'iptables' && c.args[0] === '-C')
+    assert.ok(check, '必须先用 -C 检查规则是否存在')
+    assert.deepEqual(check.args.slice(1),
+        ['INPUT', '-m', 'set', '--match-set', 'bt_blacklist', 'src', '-j', 'DROP'])
+
+    const insert = calls.find(c => c.file === 'iptables' && c.args[0] === '-I')
+    assert.ok(insert, '规则不存在时必须 -I 补装')
+    assert.deepEqual(insert.args.slice(1),
+        ['INPUT', '-m', 'set', '--match-set', 'bt_blacklist', 'src', '-j', 'DROP'])
+})
+
+test('ensureIptablesRule(4): 规则已存在时只检查、不重复 -I（幂等）', async (t) => {
+    const calls = []
+    const original = runtime.execFile
+    runtime.execFile = async (file, args) => {
+        calls.push({ file, args: [...args] })
+        // -C 成功 → 规则存在
+        return { stdout: '', stderr: '' }
+    }
+    t.after(() => { runtime.execFile = original })
+
+    const inserted = await ensureIptablesRule(4)
+    assert.equal(inserted, false, '规则已存在时返回 false')
+    assert.equal(calls.length, 1, '只应调用 -C 一次，不应再 -I')
+    assert.equal(calls[0].args[0], '-C')
+})
+
+test('ensureIptablesRule(6): 用 ip6tables + bt_blacklist6', async (t) => {
+    const calls = []
+    const original = runtime.execFile
+    runtime.execFile = async (file, args) => {
+        calls.push({ file, args: [...args] })
+        if (args[0] === '-C') throw Object.assign(new Error('no rule'), { code: 1 })
+        return { stdout: '', stderr: '' }
+    }
+    t.after(() => { runtime.execFile = original })
+
+    await ensureIptablesRule(6)
+    assert.ok(calls.every(c => c.file === 'ip6tables'), 'v6 必须用 ip6tables')
+    assert.ok(calls.every(c => c.args.includes('bt_blacklist6')), 'v6 必须引用 bt_blacklist6')
+})
+
+// ---------- blockIp: ipset add 失败不污染本地缓存 ----------
 
 test('blockIp: ipset add 失败不抛出，不污染本地缓存', async (t) => {
     config.ipv6 = true

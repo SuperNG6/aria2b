@@ -247,6 +247,41 @@ test('httpJsonPost: 绝对超时覆盖 connect 阶段（C1 回归）', async (t)
         `绝对超时必须在数秒内触发，实际花了 ${elapsed}ms（旧版 req.setTimeout 不覆盖 connect 会等 ~120s）`)
 })
 
+test('httpJsonPost: headers 已到但 body 永不发完 → 绝对超时仍触发（body 阶段无保护回归）', async (t) => {
+    // 旧实现 req.on('response', clearAbsoluteTimer) 一收到 headers 就清掉超时。
+    // 服务器只回 200 OK + headers 后 hang 住不发 body 时，client 永久挂死，
+    // cron 永远卡在 await rpcClient.post()，SIGTERM 也要等 keep-alive 期满才能 exit。
+    // 修复后的实现必须在 body 阶段仍受 absoluteTimer 保护。
+    const mock = await startServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked' })
+        res.write('{"par')   // 只发部分 body
+        // 永不调用 res.end()
+    })
+    t.after(() => mock.close())
+
+    const http = require('node:http')
+    const httpsLib = require('node:https')
+    const opts = {
+        timeout: 200,
+        httpAgent: new http.Agent({ keepAlive: false }),
+        httpsAgent: new httpsLib.Agent({ keepAlive: false })
+    }
+    t.after(() => { opts.httpAgent.destroy(); opts.httpsAgent.destroy() })
+
+    const t0 = Date.now()
+    await assert.rejects(
+        () => httpJsonPost(opts, mock.url, {}),
+        (e) => {
+            assert.equal(e.code, 'ECONNABORTED',
+                `body 阶段超时必须抛 ECONNABORTED，实际：${e.code}`)
+            return true
+        }
+    )
+    const elapsed = Date.now() - t0
+    assert.ok(elapsed < 2000,
+        `绝对超时必须在 200ms 后及时触发，实际花了 ${elapsed}ms（旧版会永久挂死）`)
+})
+
 test('httpJsonPost: 响应体超过 RPC_MAX_BODY_BYTES → e.code=EMSGSIZE', async (t) => {
     // 直接发回一个超大响应；我们把上限通过私有 const RPC_MAX_BODY_BYTES 覆盖太麻烦，
     // 改为用一个 hang 着不停发数据的服务器 + 检查 EMSGSIZE 文案。

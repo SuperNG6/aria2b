@@ -246,6 +246,19 @@ test('peerState: 获取 / 累积 / 清理', () => {
 })
 
 // ---------- syncBlockedIpsFromIpset ----------
+test('syncBlockedIpsFromIpset: 传 allowedSets 时只同步指定 set（防 flush 后错位 sync）', () => {
+    // 启动时 v6 set 是新建的（空），v4 set 已有条目时，绝不能从 flush 前的 ipsetSave
+    // 把 v6 的旧条目同步进缓存 —— 否则缓存说"已封"但 ipset 已空，cron 会跳过这些 peer。
+    const save = [
+        'add bt_blacklist 1.2.3.4 timeout 1000',
+        'add bt_blacklist6 ::1 timeout 500'
+    ].join('\n')
+    const n = syncBlockedIpsFromIpset(save, ['bt_blacklist'])
+    assert.equal(n, 1, '仅 sync v4 set')
+    assert.equal(isBlocked('1.2.3.4'), true)
+    assert.equal(isBlocked('::1'), false, 'v6 set 不在 allowedSets 中，绝不能同步')
+})
+
 test('syncBlockedIpsFromIpset: 从 ipset save 同步已封 IP', () => {
     const save = [
         'create bt_blacklist hash:ip family inet timeout 86400',
