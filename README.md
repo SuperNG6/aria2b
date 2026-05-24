@@ -4,6 +4,8 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来
 
+> **v2.2.2**：修正 Alpine 3.23 legacy iptables 安装提示：`iptables-legacy` 包已经提供 `ip6tables-legacy`，不要安装不存在的 `ip6tables-legacy` 包；优化运行日志，去掉 `Blocked` / `started!` / "累犯" / "idle mode" 等不直观话术。
+>
 > **v2.2.1**：启动同步 ipset 状态时给 `ipset save` 配置更大的 stdout buffer，避免长期运行黑名单较大时触发 Node 默认 1MB `maxBuffer`；`system.multicall` 子调用 fault / 结果缺失会被视为部分失败，不清理 `peerState`，避免 noprogress 累计被误清。防火墙行为面不变，仍只维护 `bt_blacklist` / `bt_blacklist6` 及对应 INPUT 规则。
 >
 > **v2.1.0**：修复 v2.0.0 的 `scanTimer.unref()` 导致进程在 Docker/s6 下被反复拉起的关键 bug；修复 `block_keywords=Unknown` 不生效、`isLocalHttpsRpcUrl` 子域绕过、CLI 数字 secret 丢前导 0 等问题；**完全移除 axios**，改用 Node 原生 `http/https.request`，bundle 从 520KB → 50KB（10× 缩减），运行依赖仅剩 1 个；新增 ESLint、IPv6 / RPC / parseArgv 全面回归测试（38 → 86）。
@@ -43,7 +45,13 @@ IPv6 默认根据系统 `/proc/net/if_inet6` 自动启用，对应使用 `bt_bla
 开机自动启动 `ipset` `iptables` 按照自己需求来安排
 ### Alpine
 
-    apk add iptables ip6tables ipset nodejs
+    apk add --no-cache iptables ipset nodejs
+
+若运行在群晖 DSM 4.x 等老内核环境，建议同时安装 legacy 后端：
+
+    apk add --no-cache iptables iptables-legacy ipset nodejs
+
+Alpine 3.23 中 `iptables` 包已提供 `ip6tables`，`iptables-legacy` 包已提供 `ip6tables-legacy`；不需要安装 `ip6tables-legacy` 这个包名。
 ### Ubuntu / Debian
     apt-get install ipset
 ### ArchLinux

@@ -510,7 +510,7 @@ function looksLikeNftBackendIssue(err) {
 function logIptablesBackendHint() {
     honsole.error('诊断：错误信号疑似 iptables-nft 后端 / xt_set 内核模块不兼容（常见于 Synology DSM 4.x 等老内核）。')
     honsole.error('修复：在镜像里安装 iptables-legacy 后 aria2b 会自动探测并切换：')
-    honsole.error('      apk add --no-cache iptables-legacy ip6tables-legacy')
+    honsole.error('      apk add --no-cache iptables iptables-legacy ipset nodejs')
 }
 
 /**
@@ -625,7 +625,7 @@ async function ensureIptablesRule(version) {
 }
 
 /**
- * 启动阶段环境致命错误（IPv4 后端不可用 / ipset 缺失 等）时进入"空闲模式"。
+ * 启动阶段环境致命错误（IPv4 后端不可用 / ipset 缺失 等）时暂停扫描并保活。
  *
  * 不变量 #15：进程必须保持存活，绝不 process.exit。
  *
@@ -636,7 +636,7 @@ async function ensureIptablesRule(version) {
  *   2. 占满 CPU 和 fork 配额，拖慢同容器里的 aria2c
  *   3. 用户没法看到真正的修复指引，因为它被滚动日志冲掉
  *
- * 空闲模式：进程不退出，只保留一个 refed setInterval 当作"心跳"让事件循环 alive，
+ * 暂停扫描并保活：进程不退出，只保留一个 refed setInterval 当作"心跳"让事件循环 alive，
  * 不再执行任何 ipset/iptables 操作。aria2c 主服务不受影响。
  * 每小时打一次提醒日志告诉用户问题仍未修复 —— 避免日志膨胀，又不让人遗忘。
  */
@@ -651,12 +651,12 @@ function runIdleMode(reason) {
         return   // 测试里 process.exit 被 mock 时让函数提前结束，避免继续装 idleHeartbeat
     }
 
-    honsole.error('aria2b 进入空闲模式（保持进程存活避免 s6-overlay 反复重启容器服务）。')
+    honsole.error('aria2b 启动环境不可用，已暂停扫描并保持进程运行，避免容器反复重启。')
     honsole.error(`原因：${reason}`)
-    honsole.error('当前不会做任何 ipset/iptables 操作；aria2c / AriaNg 等同容器服务不受影响。')
-    honsole.error('修复后请重启容器。常见修复：在 Dockerfile 增加 `apk add --no-cache iptables-legacy ip6tables-legacy`。')
+    honsole.error('影响：aria2b 暂时不会封禁 peer；aria2c / AriaNg 不受影响。')
+    honsole.error('处理：修复环境后重启容器。常见修复：在 Dockerfile 增加 `apk add --no-cache iptables iptables-legacy ipset nodejs`。')
 
-    // idle mode 可能在 cron 运行期间被 uncaughtException 触发：必须立刻停掉调度循环，
+    // 暂停扫描并保活可能在 cron 运行期间被 uncaughtException 触发：必须立刻停掉调度循环，
     // 否则 cron 会在 idleHeartbeat 装好后继续每 N 秒跑一次，徒增 RPC / 子进程开销。
     // scheduleNext() 同样检查 idleHeartbeat 防止重新装上 scanTimer。
     if (scanTimer) { clearTimeout(scanTimer); scanTimer = null }
@@ -670,7 +670,7 @@ function runIdleMode(reason) {
     idleHeartbeat = setInterval(() => {
         // 不 unref：CLAUDE.md 第 1 条不变量说事件循环里必须有 refed handle，
         // 否则 Node 会在 keep-alive 池超时后静默 exit(0) → s6 重启 → crash-loop 复发。
-        honsole.error(`aria2b 仍处于空闲模式（${reason}）—— 请修复后重启容器`)
+        honsole.error(`aria2b 仍因启动环境不可用而暂停扫描（${reason}）—— 修复后请重启容器`)
     }, HOUR)
 }
 
@@ -718,7 +718,9 @@ async function blockIp(ip, info) {
         // -exist 让重复添加也刷新 timeout，本地缓存与 ipset 时钟保持一致
         await runtime.execFile('ipset', ['add', '-exist', setName, ip, 'timeout', String(config.timeout)])
         rememberBlocked(ip)
-        honsole.logt('Blocked:', ip, info.origin || '', info.client || '', info.version || '')
+        const clientInfo = [info.origin, info.client, info.version].filter(Boolean).join(' ')
+        const suffix = clientInfo ? `（客户端：${clientInfo}，时长：${config.timeout}s）` : `（时长：${config.timeout}s）`
+        honsole.logt(`已封禁 IP：${ip}${suffix}`)
     } catch (e) {
         honsole.warn('封禁失败:', ip, sanitizeError(e))
     }
@@ -763,9 +765,9 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
                 if (downloadSpeed === 0) {
                     s.wait += 1
                     if (s.wait > config.noprogress_wait) {
-                        const human = decodeClient(peer.peerId).substring(0, 16).padEnd(16, ' ')
+                        const human = decodeClient(peer.peerId).substring(0, 16) || 'unknown'
                         const np = Number(status.numPieces) || 0
-                        honsole.log(`往 ${human}（${peer.ip}）传输了 ${uploadPiece.toFixed(2)} 个 piece，但它声称进度 ${bitprogress}/${np}，累犯 ${s.wait} 次，ban 了`)
+                        honsole.log(`封禁疑似无进度上传 BT peer：${peer.ip}（${human}）；已上传约 ${uploadPiece.toFixed(2)} 个分片，对方进度仍为 ${bitprogress}/${np}，连续异常 ${s.wait} 次（阈值 ${config.noprogress_wait}）`)
                         toBlock = true
                     }
                 } else {
@@ -867,7 +869,7 @@ function backoffDelay() {
 
 function scheduleNext() {
     if (shuttingDown) return
-    // idle mode 一旦启用，cron 永久停止调度 —— idleHeartbeat 是 idle 状态的 source of truth。
+    // 暂停扫描并保活一旦启用，cron 永久停止调度 —— idleHeartbeat 是该状态的 source of truth。
     // 否则 cron 内部抛 uncaughtException 触发 runIdleMode 后，下一轮 scheduleNext 还会装回
     // scanTimer，每 N 秒空跑一次拖资源。
     if (idleHeartbeat) return
@@ -1091,7 +1093,7 @@ function installSignalHandlers() {
     process.on('SIGINT',  () => { stop('SIGINT').catch(()  => process.exit(0)) })
     process.on('SIGHUP',  () => { stop('SIGHUP').catch(()  => process.exit(0)) })
     // uncaughtException / unhandledRejection 是程序内部 bug，不是环境问题；
-    // 进入 idle mode 保活（s6-overlay v2 反复重启会拖垮容器；让 aria2b 静默存活，
+    // 暂停扫描并保活（s6-overlay v2 反复重启会拖垮容器；让 aria2b 静默存活，
     // 同容器里 aria2c / AriaNg 继续工作；用户能从日志里看到 stack trace 修 bug）。
     process.on('uncaughtException', e => {
         try { honsole.error('uncaughtException:', sanitizeError(e)) } catch (_) {}
@@ -1142,14 +1144,14 @@ async function initial() {
     // 探测 iptables 后端：Alpine 3.13+ 的 `iptables` 包默认指向 nft 后端，
     // 在群晖 DSM 4.x 老内核 / 部分老 NAS 上 nft 子系统初始化即失败，整个 iptables 路径都用不了。
     // 这里探测默认能否工作，不行就尝试切到 `iptables-legacy`（前提是镜像装了 iptables-legacy 包）。
-    //   IPv4 失败 → 进入空闲模式（绝不 process.exit，否则会触发 s6 crash-loop 拖死容器）
+    //   IPv4 失败 → 暂停扫描并保活（绝不 process.exit，否则会触发 s6 crash-loop 拖死容器）
     //   IPv6 失败 → 软降级：仅 IPv4 仍然能干活，给用户明确提示
     if (!await pickIptablesBackendForVersion(4)) {
         return runIdleMode('IPv4 iptables 后端不可用（默认 nft 与 iptables-legacy 都无法工作）。修复：在镜像里装 iptables-legacy 包；若已装请检查容器 NET_ADMIN capability 与内核 ipset 模块')
     }
     if (config.ipv6 && !await pickIptablesBackendForVersion(6)) {
         honsole.warn('IPv6 iptables 后端不可用，自动降级为仅 IPv4 模式继续运行（IPv4 拦截不受影响）。')
-        honsole.warn('若需启用 IPv6 拦截，请在镜像里装 iptables-legacy + ip6tables-legacy；')
+        honsole.warn('若需启用 IPv6 拦截，请在镜像里装 iptables-legacy（Alpine 3.23 中它同时提供 ip6tables-legacy）；')
         honsole.warn('若本就不需要 IPv6，可在 aria2.conf 设 disable-ipv6=true 消除此警告。')
         config.ipv6 = false
     }
@@ -1167,7 +1169,7 @@ async function initial() {
         }
     } catch (e) {
         // 探测通过但 flush/ensure 阶段失败（典型场景：xt_set 模块在该内核完全残缺，
-        // 即便 legacy 后端也救不了）→ 同样进入空闲模式而不是 crash。
+        // 即便 legacy 后端也救不了）→ 同样暂停扫描并保活而不是 crash。
         return runIdleMode(`IPv4 ipset/iptables 初始化失败：${sanitizeError(e)}`)
     }
     // IPv6 setup 即便后端探测通过，xt_set 实际加载 `-m set` 仍可能失败（内核 xt_set 模块
@@ -1207,9 +1209,9 @@ async function initial() {
 
     honsole.log(`${config.rpc_url} secret: ${maskSecret(config.secret)}`)
     honsole.log(`屏蔽客户端：${config.block_keywords.join(', ')}`)
-    honsole.log(`监视进度：${config.noprogress_keywords.join(', ')}（>${config.noprogress_piece} pieces，累犯 ${config.noprogress_wait} 次）`)
+    honsole.log(`无进度上传监控：${config.noprogress_keywords.join(', ')}（累计上传 >${config.noprogress_piece} 个分片且进度仍为 0，连续命中 ${config.noprogress_wait} 次后封禁）`)
     honsole.log(`扫描间隔 ${config.scan_interval}ms，封禁时长 ${config.timeout}s，IPv6 ${config.ipv6 ? '启用' : '禁用'}`)
-    honsole.logt('started!')
+    honsole.logt('aria2b 已启动，开始扫描 aria2 peer')
 
     runLoop()
 }
@@ -1217,7 +1219,7 @@ async function initial() {
 if (require.main === module) {
     initial().catch(e => {
         try { honsole.error('启动失败：', sanitizeError(e)) } catch (_) {}
-        // 启动阶段未捕获异常（initial 内部应该都 try 过了，这里是兜底）：进入 idle mode
+        // 启动阶段未捕获异常（initial 内部应该都 try 过了，这里是兜底）：暂停扫描并保活
         // 而不是 exit，避免 s6-overlay v2 反复重启容器服务（参见 runIdleMode 注释）。
         runIdleMode(`启动异常：${sanitizeError(e)}`)
     })
@@ -1261,7 +1263,7 @@ module.exports = {
             // 避免上一个用例污染下一个用例的断言（spy.calls 期望命中 'iptables'）。
             iptablesBinaries.v4 = 'iptables'
             iptablesBinaries.v6 = 'ip6tables'
-            // idle mode 在测试里被触发会留下 refed setInterval，会让 node --test 不退出。
+            // 暂停扫描并保活在测试里被触发会留下 refed setInterval，会让 node --test 不退出。
             if (idleHeartbeat) { clearInterval(idleHeartbeat); idleHeartbeat = null }
             consecutiveFailures = 0
             shuttingDown = false

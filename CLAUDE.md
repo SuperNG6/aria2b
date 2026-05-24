@@ -34,13 +34,13 @@ cron() 主循环（scheduleNext → backoffDelay）
   ├─ system.multicall            一次批量拿所有 (tellStatus + getPeers)
   ├─ processOnePeer()            对每个 peer 跑策略
   │     ├─ keywordMatches        block_keywords 命中 → ban
-  │     └─ noprogress 状态机      累计上传 > N pieces 且 bitfield=0 累犯 wait 次 → ban
+  │     └─ noprogress 状态机      累计上传 > N pieces 且 bitfield=0 连续命中 wait 次 → ban
   └─ blockIp() → ipset add       顺序 ban（不并发，避免子进程竞争）
 ```
 
 状态：
 - `blockedIps: Map<ip, expiresAtMs>` — 本进程封禁缓存，避免重复 `ipset add`；启动时由 `readIpsetSave()` + `syncBlockedIpsFromIpset` 从 `ipset save` 同步
-- `peerState: Map<key, {uploaded, wait}>` — noprogress 累犯状态机；key 是 `gid\0peerId\0ip`
+- `peerState: Map<key, {uploaded, wait}>` — noprogress 连续命中状态机；key 是 `gid\0peerId\0ip`
 - 两个 Map 都有容量上限（`MAX_BLOCKED_IPS=200000` / `MAX_PEER_STATE=50000`），超限时 FIFO 淘汰最老条目
 
 配置合并顺序：`defaultConfig()` → 读 aria2.conf 寄生配置（`ab-*` 开头的键） → CLI 参数覆盖。aria2.conf 路径搜索顺序见 `findAria2Config()`。
@@ -77,13 +77,13 @@ cron() 主循环（scheduleNext → backoffDelay）
 
 14. **iptables 规则自愈：set 存在时仍要 `ensureIptablesRule()`**（[app.js:502-518](app.js#L502-L518)）。前次启动如果在 `ipset create` 之后、`iptables -I` 之前被 SIGKILL 打断，`hasIpset` 返回 true → 跳过 flush → 规则永远不会被装上，aria2b 跑得欢快但实际一个 IP 都拦不住。`iptables -C` 检查规则在不在，不在则幂等 `-I` 补装。`-C` 是 docker alpine 上的标准选项。
 
-15. **启动阶段环境不可用时必须进 `runIdleMode()`，绝不 `process.exit(1)`**（[app.js:642-678](app.js#L642-L678)）。aria2b 在 docker-aria2 镜像里是 s6-overlay v2 的一个 service，进程退出会触发 s6 默认策略"无限重启" —— 每 1-2 秒拉起一次。如果环境本身不兼容（群晖 DSM 4.x 内核 + iptables-nft、缺 NET_ADMIN、ipset 二进制缺失、未捕获异常），exit 会把日志淹没、占满 fork 配额、拖慢同容器里的 aria2c。`runIdleMode` 用一个 refed `setInterval`（1h 心跳，**不**能 unref，否则进程会因无 refed handle 静默 exit 重蹈第 1 条覆辙）让事件循环保活、每小时打一次修复提示；同时清掉 `scanTimer` + destroy `rpcClient` 停止 cron 调度。相关入口：IPv4 后端探测失败 / ipset save 失败 / `initial()` 兜底 catch / uncaughtException / unhandledRejection。`scheduleNext` 也要看 `idleHeartbeat` 跳过装回 timer。SIGTERM/SIGINT 处理器要 `clearInterval(idleHeartbeat)` 后正常 exit(0)。
+15. **启动阶段环境不可用时必须进 `runIdleMode()`，绝不 `process.exit(1)`**（[app.js:642-678](app.js#L642-L678)）。aria2b 在 docker-aria2 镜像里是 s6-overlay v2 的一个 service，进程退出会触发 s6 默认策略"无限重启" —— 每 1-2 秒拉起一次。如果环境本身不兼容（群晖 DSM 4.x 内核 + iptables-nft、缺 NET_ADMIN、ipset 二进制缺失、未捕获异常），exit 会把日志淹没、占满 fork 配额、拖慢同容器里的 aria2c。`runIdleMode` 用一个 refed `setInterval`（1h 心跳，**不**能 unref，否则进程会因无 refed handle 静默 exit 重蹈第 1 条覆辙）让事件循环保活、每小时打一次修复提示；同时清掉 `scanTimer` + destroy `rpcClient` 停止 cron 调度。对用户日志不要写抽象模式名，要直接说明"启动环境不可用、已暂停扫描、aria2c 不受影响、修复后重启容器"。相关入口：IPv4 后端探测失败 / ipset save 失败 / `initial()` 兜底 catch / uncaughtException / unhandledRejection。`scheduleNext` 也要看 `idleHeartbeat` 跳过装回 timer。SIGTERM/SIGINT 处理器要 `clearInterval(idleHeartbeat)` 后正常 exit(0)。
 
-16. **iptables 后端探测优先级：默认 → legacy，不自动 apk add**（[app.js:538-571](app.js#L538-L571)）。Alpine 3.13+ 的 `iptables` 包默认指向 nft 后端；群晖 DSM 4.x 内核上 nft 子系统初始化即失败（`Could not fetch rule set generation id`）。`pickIptablesBackendForVersion()` 先用 `bin -L INPUT -n` 作为最小探针（不依赖 ipset/任何扩展模块，且 `-n` 跳过反向 DNS 防容器无 DNS 时阻塞 30s+）探测默认；失败再探 `iptables-legacy`。结果写入全局 `iptablesBinaries.v4/v6`，后续 `flushIptablesIpset` / `ensureIptablesRule` 都读这个 map。设计选择：**不在 aria2b 里自动 `apk add iptables-legacy`** —— 违反零运维原则（需要网络 + root + 增加启动延迟），只让用户在 Dockerfile 里装好，aria2b 自己探测切换。
+16. **iptables 后端探测优先级：默认 → legacy，不自动 apk add**（[app.js:538-571](app.js#L538-L571)）。Alpine 3.13+ 的 `iptables` 包默认指向 nft 后端；群晖 DSM 4.x 内核上 nft 子系统初始化即失败（`Could not fetch rule set generation id`）。`pickIptablesBackendForVersion()` 先用 `bin -L INPUT -n` 作为最小探针（不依赖 ipset/任何扩展模块，且 `-n` 跳过反向 DNS 防容器无 DNS 时阻塞 30s+）探测默认；失败再探 `iptables-legacy`。结果写入全局 `iptablesBinaries.v4/v6`，后续 `flushIptablesIpset` / `ensureIptablesRule` 都读这个 map。Alpine 3.23 中 `iptables` 包提供 `iptables` + `ip6tables`，`iptables-legacy` 包提供 `iptables-legacy` + `ip6tables-legacy`；没有独立 `ip6tables-legacy` 包，Dockerfile 提示必须写 `apk add --no-cache iptables iptables-legacy ipset nodejs`。设计选择：**不在 aria2b 里自动 `apk add iptables-legacy`** —— 违反零运维原则（需要网络 + root + 增加启动延迟），只让用户在 Dockerfile 里装好，aria2b 自己探测切换。
 
 17. **IPv6 setup 失败必须软降级，绝不让 IPv4 跟着挂**（[app.js:1130-1156](app.js#L1130-L1156)）。群晖 DSM 4.4 内核环境下 `ip6tables -m set` 即便切到 legacy 也可能因 xt_set 模块对 IPv6 路径残缺而失败。v2.1 之前 v6 抛错让进程 exit，s6 重启第二轮 IPv4 才幸运通过 —— 这是 v1.x"误打误撞跑成"的 race 路径，v2.1 加 `ensureIptablesRule` 自愈反而把这个 race 关死了。现在：v6 探测失败 → `config.ipv6=false`；v6 flush/ensure 抛错 → catch + `config.ipv6=false`。降级信号统一通过 `config.ipv6` 传给下游（`blockIp` / `syncBlockedIpsFromIpset` / cron 都读它）。已被 flush 但中途失败的 v6 set 不能 sync（`v6Flushed=false` 后续 syncTargets 跳过），否则缓存说"已封"但 ipset 已空 → cron `isBlocked=true` 跳过 peer → 永远拦不住。
 
-18. **启动读取 `ipset save` 必须走 `readIpsetSave()` 并保留 32MB `maxBuffer`**（[app.js:706](app.js#L706)）。docker-aria2 a2b variant 常用 `network_mode: host` + `NET_ADMIN`，aria2b 看到的是当前网络命名空间里的全部 ipset；长期运行黑名单较大时，Node `execFile` 默认 1MB stdout buffer 会杀掉子进程，让 aria2b 误进 idle mode。不要为这个低频启动路径引入流式解析；除非有真实宿主大型 ipset 反馈，否则 32MB buffer 是当前最小修复。
+18. **启动读取 `ipset save` 必须走 `readIpsetSave()` 并保留 32MB `maxBuffer`**（[app.js:706](app.js#L706)）。docker-aria2 a2b variant 常用 `network_mode: host` + `NET_ADMIN`，aria2b 看到的是当前网络命名空间里的全部 ipset；长期运行黑名单较大时，Node `execFile` 默认 1MB stdout buffer 会杀掉子进程，让 aria2b 误进入"暂停扫描并保活"状态。不要为这个低频启动路径引入流式解析；除非有真实宿主大型 ipset 反馈，否则 32MB buffer 是当前最小修复。
 
 19. **`system.multicall` 子调用 fault / 结果缺失必须视为部分失败，不能清 `peerState`**（[app.js:817](app.js#L817)）。aria2c 任务状态变化时，单个 `tellStatus` / `getPeers` 可能返回 `{ faultCode, faultString }` 或缺结果；这种情况下活跃集合不完整，本轮跳过对应 gid，并保持 `fullySucceeded=false`。只有结果长度匹配且每个子调用成功时才允许 `cleanupPeerState(activeKeys)`。
 
@@ -92,7 +92,7 @@ cron() 主循环（scheduleNext → backoffDelay）
 - 用 `node:test` + `node:assert/strict`，不用第三方框架（保持依赖最少）
 - [test/cron.test.js](test/cron.test.js) 通过 `http.createServer` 起 mock aria2 RPC + monkey-patch `runtime.execFile` spy 来端到端验证主循环
 - [test/rpc.test.js](test/rpc.test.js) 直接测 `httpJsonPost`：4xx/3xx/5xx、ECONNREFUSED、绝对超时、JSON 解析失败、64MB body 上限、keep-alive 复用、自签 TLS、`destroy()` 中断 in-flight
-- [test/iptables.test.js](test/iptables.test.js) 覆盖 ipset / iptables setup、后端探测、idle mode，以及启动 `ipset save` buffer 约束
+- [test/iptables.test.js](test/iptables.test.js) 覆盖 ipset / iptables setup、后端探测、启动环境不可用时暂停扫描并保活，以及启动 `ipset save` buffer 约束
 - 上面列的每个"关键不变量"都有对应回归测试，改相关代码必须先看测试再动
 - `_internal._reset()` 在测试 setup 里调用，重置全局 config / blockedIps / peerState
 
