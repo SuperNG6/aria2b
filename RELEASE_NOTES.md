@@ -1,3 +1,15 @@
+# v2.2.1
+
+## 修复
+
+- 启动读取 `ipset save` 时通过 `readIpsetSave()` 配置 32MB stdout buffer，避免长期运行黑名单较大时触发 Node `execFile` 默认 1MB `maxBuffer`，从而误进 idle mode。
+- `system.multicall` 子调用 fault / 结果缺失现在视为部分失败：本轮跳过异常 gid，但不清理 `peerState`，避免 noprogress 累计被 aria2c 任务状态 race 误清。
+- 防火墙行为面不变：仍只维护 `bt_blacklist` / `bt_blacklist6` 两个 ipset，以及引用它们的 INPUT DROP 规则；不 flush 全局防火墙表、不改 Docker chains、不改默认策略。
+
+## 测试
+
+- 107/107 通过。新增 `readIpsetSave` maxBuffer 回归测试，以及 `system.multicall` 子调用 fault 不清 `peerState` 的回归测试。
+
 # v2.2.0
 
 ## 概要

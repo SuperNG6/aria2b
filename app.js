@@ -33,6 +33,7 @@ const MIN_SCAN_INTERVAL = 1000
 const MAX_SCAN_INTERVAL = 60000
 const RPC_HTTP_TIMEOUT = 30000
 const RPC_MAX_BODY_BYTES = 64 * 1024 * 1024
+const IPSET_SAVE_MAX_BUFFER_BYTES = 32 * 1024 * 1024
 const MAX_BACKOFF_DELAY = 60000
 const MAX_BLOCKED_IPS = 200000   // ipset hash:ip 默认 65536，本地缓存放宽一些
 const MAX_PEER_STATE = 50000     // peer 状态机容量上限（防意外膨胀）
@@ -702,6 +703,11 @@ function syncBlockedIpsFromIpset(saveOutput, allowedSets) {
     return count
 }
 
+async function readIpsetSave() {
+    const r = await runtime.execFile('ipset', ['save'], { maxBuffer: IPSET_SAVE_MAX_BUFFER_BYTES })
+    return r.stdout || ''
+}
+
 async function blockIp(ip, info) {
     const v = net.isIP(ip)
     if (!v) { honsole.warn('跳过无效 IP:', ip); return }
@@ -791,6 +797,7 @@ async function cron() {
     const activeKeys = new Set()
     const banQueue = []
     let fullySucceeded = false
+    let partialFailure = false
 
     try {
         // 1) 拿活跃任务 gid 列表
@@ -807,6 +814,7 @@ async function cron() {
                 calls.push({ method: 'aria2.getPeers',  params: [gid] })
             }
             results = await rpcMulticall(calls)
+            if (results.length !== calls.length) partialFailure = true
         }
 
         // 3) 解析处理
@@ -815,8 +823,12 @@ async function cron() {
             // multicall 子调用：成功返回 [result]，失败返回 { faultCode, faultString }
             const statusRes = results[i * 2]
             const peersRes  = results[i * 2 + 1]
-            const status = Array.isArray(statusRes) ? (statusRes[0] || {}) : {}
-            const peers  = Array.isArray(peersRes)  ? (peersRes[0]  || []) : []
+            if (!Array.isArray(statusRes) || !Array.isArray(peersRes)) {
+                partialFailure = true
+                continue
+            }
+            const status = statusRes[0] || {}
+            const peers  = peersRes[0]  || []
             if (!Array.isArray(peers)) continue
             for (const peer of peers) {
                 if (!peer || !peer.ip) continue
@@ -831,7 +843,7 @@ async function cron() {
         }
 
         consecutiveFailures = 0
-        fullySucceeded = true
+        fullySucceeded = !partialFailure
     } catch (e) {
         consecutiveFailures += 1
         // 抑制刷屏：只在 1/2/5/10/20/30… 次失败时打日志
@@ -1120,8 +1132,7 @@ async function initial() {
     // 读 ipset 当前状态
     let ipsetSave = ''
     try {
-        const r = await runtime.execFile('ipset', ['save'])
-        ipsetSave = r.stdout || ''
+        ipsetSave = await readIpsetSave()
     } catch (e) {
         honsole.error(`执行 ipset save 失败：${sanitizeError(e)}`)
         honsole.error('请确认容器具备 NET_ADMIN 能力且已安装 ipset')
@@ -1228,7 +1239,7 @@ module.exports = {
         // state mgmt
         getPeerState, cleanupPeerState,
         isBlocked, rememberBlocked, cleanupBlockedIps,
-        syncBlockedIpsFromIpset,
+        syncBlockedIpsFromIpset, readIpsetSave,
         // CLI
         parseArgv, applyCliConfig, applyNoVerify, loadConfigFromAria2File,
         // ipset / iptables

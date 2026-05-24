@@ -265,6 +265,63 @@ test('cron: noprogress 计数器累积、不重置（部分 RPC 失败时）', a
     assert.equal(banCalls[0].args[3], '203.0.113.6')
 })
 
+test('cron: system.multicall 子调用 fault 时不清 peerState', async (t) => {
+    _reset()
+    config.noprogress_piece = 1
+    config.noprogress_wait = 10
+    config.scan_interval = 1000
+    config.noprogress_keywords = ['XL']
+    config.block_keywords = ['NEVER_MATCH']
+
+    let mode = 'ok'
+    const mock = await startMockAria2((req) => {
+        if (req.method === 'aria2.tellActive') return { result: [{ gid: 'gid-1' }] }
+        if (req.method === 'system.multicall') {
+            if (mode === 'child-fault') {
+                return { result: [
+                    { faultCode: 1, faultString: 'gid disappeared' },
+                    { faultCode: 1, faultString: 'gid disappeared' }
+                ] }
+            }
+            const calls = req.params[0]
+            const results = calls.map(c => {
+                if (c.methodName === 'aria2.tellStatus') return [{ numPieces: 10, pieceLength: 1024 }]
+                if (c.methodName === 'aria2.getPeers') return [[
+                    {
+                        peerId: '%2DXL0012%2Dabcdef012345',
+                        ip: '203.0.113.60',
+                        uploadSpeed: 10240,
+                        downloadSpeed: 0,
+                        bitfield: '00'
+                    }
+                ]]
+                return [null]
+            })
+            return { result: results }
+        }
+        return { result: [] }
+    })
+    t.after(() => mock.close())
+
+    config.rpc_url = mock.url
+    _setRpcClient(_makeRpcClient())
+    const spy = spyExecFile()
+    t.after(() => spy.restore())
+
+    await cron()
+    assert.equal(peerState.size, 1)
+    assert.equal([...peerState.values()][0].wait, 1)
+
+    mode = 'child-fault'
+    await cron()
+    assert.equal(peerState.size, 1, 'multicall 子调用 fault 属于部分失败，不能清掉累计状态')
+    assert.equal([...peerState.values()][0].wait, 1)
+
+    mode = 'ok'
+    await cron()
+    assert.equal([...peerState.values()][0].wait, 2, '恢复后应接着原状态继续累计')
+})
+
 // ---------- cron: bitfield 有进度 → 不 ban ----------
 
 test('cron: 上传中且 bitfield 有进度 → 不 ban', async (t) => {
@@ -546,4 +603,3 @@ test('scheduleNext: 装的 timer 必须保持 refed（否则进程会静默退�
         _internal._clearScanTimer()
     }
 })
-

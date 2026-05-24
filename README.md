@@ -4,6 +4,8 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来
 
+> **v2.2.1**：启动同步 ipset 状态时给 `ipset save` 配置更大的 stdout buffer，避免长期运行黑名单较大时触发 Node 默认 1MB `maxBuffer`；`system.multicall` 子调用 fault / 结果缺失会被视为部分失败，不清理 `peerState`，避免 noprogress 累计被误清。防火墙行为面不变，仍只维护 `bt_blacklist` / `bt_blacklist6` 及对应 INPUT 规则。
+>
 > **v2.1.0**：修复 v2.0.0 的 `scanTimer.unref()` 导致进程在 Docker/s6 下被反复拉起的关键 bug；修复 `block_keywords=Unknown` 不生效、`isLocalHttpsRpcUrl` 子域绕过、CLI 数字 secret 丢前导 0 等问题；**完全移除 axios**，改用 Node 原生 `http/https.request`，bundle 从 520KB → 50KB（10× 缩减），运行依赖仅剩 1 个；新增 ESLint、IPv6 / RPC / parseArgv 全面回归测试（38 → 86）。
 >
 > **v2.0.0**：稳定性大修。RPC 改 keep-alive 长连接 + system.multicall 批量；增加指数退避、SIGTERM 优雅退出、本地缓存 LRU、启动同步 ipset 状态、错误日志脱敏 secret；发布物改为单文件 bundle（无需 node_modules，curl 下来 chmod 即可跑），适合 Docker / OpenWrt。要求 Node.js 22+。

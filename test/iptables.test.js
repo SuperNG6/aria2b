@@ -15,7 +15,7 @@ const {
     iptablesBinaries,
     looksLikeNftBackendIssue, pickIptablesBackendForVersion,
     flushIptablesIpset, ensureIptablesRule, blockIp,
-    runIdleMode,
+    runIdleMode, readIpsetSave,
     isBlocked,
     _reset, _getIdleHeartbeat
 } = _internal
@@ -48,6 +48,23 @@ function spyExecFileWithError(matcher, err) {
 }
 
 test.beforeEach(() => _reset())
+
+test('readIpsetSave: 给 ipset save 配置足够大的 maxBuffer（长期运行黑名单较大）', async (t) => {
+    const original = runtime.execFile
+    let captured = null
+    runtime.execFile = async (file, args, opts) => {
+        captured = { file, args: [...args], opts }
+        return { stdout: 'create bt_blacklist hash:ip timeout 86400\n', stderr: '' }
+    }
+    t.after(() => { runtime.execFile = original })
+
+    const out = await readIpsetSave()
+    assert.equal(out, 'create bt_blacklist hash:ip timeout 86400\n')
+    assert.equal(captured.file, 'ipset')
+    assert.deepEqual(captured.args, ['save'])
+    assert.ok(captured.opts.maxBuffer >= 16 * 1024 * 1024,
+        `ipset save maxBuffer 应明显大于 Node 默认 1MB，实际 ${captured.opts.maxBuffer}`)
+})
 
 // ---------- flushIptablesIpset(4) ----------
 

@@ -39,7 +39,7 @@ cron() 主循环（scheduleNext → backoffDelay）
 ```
 
 状态：
-- `blockedIps: Map<ip, expiresAtMs>` — 本进程封禁缓存，避免重复 `ipset add`；启动时由 `syncBlockedIpsFromIpset` 从 `ipset save` 同步
+- `blockedIps: Map<ip, expiresAtMs>` — 本进程封禁缓存，避免重复 `ipset add`；启动时由 `readIpsetSave()` + `syncBlockedIpsFromIpset` 从 `ipset save` 同步
 - `peerState: Map<key, {uploaded, wait}>` — noprogress 累犯状态机；key 是 `gid\0peerId\0ip`
 - 两个 Map 都有容量上限（`MAX_BLOCKED_IPS=200000` / `MAX_PEER_STATE=50000`），超限时 FIFO 淘汰最老条目
 
@@ -83,11 +83,16 @@ cron() 主循环（scheduleNext → backoffDelay）
 
 17. **IPv6 setup 失败必须软降级，绝不让 IPv4 跟着挂**（[app.js:1130-1156](app.js#L1130-L1156)）。群晖 DSM 4.4 内核环境下 `ip6tables -m set` 即便切到 legacy 也可能因 xt_set 模块对 IPv6 路径残缺而失败。v2.1 之前 v6 抛错让进程 exit，s6 重启第二轮 IPv4 才幸运通过 —— 这是 v1.x"误打误撞跑成"的 race 路径，v2.1 加 `ensureIptablesRule` 自愈反而把这个 race 关死了。现在：v6 探测失败 → `config.ipv6=false`；v6 flush/ensure 抛错 → catch + `config.ipv6=false`。降级信号统一通过 `config.ipv6` 传给下游（`blockIp` / `syncBlockedIpsFromIpset` / cron 都读它）。已被 flush 但中途失败的 v6 set 不能 sync（`v6Flushed=false` 后续 syncTargets 跳过），否则缓存说"已封"但 ipset 已空 → cron `isBlocked=true` 跳过 peer → 永远拦不住。
 
+18. **启动读取 `ipset save` 必须走 `readIpsetSave()` 并保留 32MB `maxBuffer`**（[app.js:706](app.js#L706)）。docker-aria2 a2b variant 常用 `network_mode: host` + `NET_ADMIN`，aria2b 看到的是当前网络命名空间里的全部 ipset；长期运行黑名单较大时，Node `execFile` 默认 1MB stdout buffer 会杀掉子进程，让 aria2b 误进 idle mode。不要为这个低频启动路径引入流式解析；除非有真实宿主大型 ipset 反馈，否则 32MB buffer 是当前最小修复。
+
+19. **`system.multicall` 子调用 fault / 结果缺失必须视为部分失败，不能清 `peerState`**（[app.js:817](app.js#L817)）。aria2c 任务状态变化时，单个 `tellStatus` / `getPeers` 可能返回 `{ faultCode, faultString }` 或缺结果；这种情况下活跃集合不完整，本轮跳过对应 gid，并保持 `fullySucceeded=false`。只有结果长度匹配且每个子调用成功时才允许 `cleanupPeerState(activeKeys)`。
+
 ## 测试约定
 
 - 用 `node:test` + `node:assert/strict`，不用第三方框架（保持依赖最少）
 - [test/cron.test.js](test/cron.test.js) 通过 `http.createServer` 起 mock aria2 RPC + monkey-patch `runtime.execFile` spy 来端到端验证主循环
 - [test/rpc.test.js](test/rpc.test.js) 直接测 `httpJsonPost`：4xx/3xx/5xx、ECONNREFUSED、绝对超时、JSON 解析失败、64MB body 上限、keep-alive 复用、自签 TLS、`destroy()` 中断 in-flight
+- [test/iptables.test.js](test/iptables.test.js) 覆盖 ipset / iptables setup、后端探测、idle mode，以及启动 `ipset save` buffer 约束
 - 上面列的每个"关键不变量"都有对应回归测试，改相关代码必须先看测试再动
 - `_internal._reset()` 在测试 setup 里调用，重置全局 config / blockedIps / peerState
 
