@@ -70,6 +70,7 @@ let consecutiveFailures = 0
 let shuttingDown = false
 let scanTimer = null
 let cronInflight = null
+let idleHeartbeat = null
 
 // 间接层：测试时可替换 execFile，便于在没有 ipset 的环境验证调用
 const runtime = {
@@ -478,8 +479,98 @@ async function rpcMulticall(calls) {
 // ipset / iptables
 // ============================================================================
 
+// 当前选用的 iptables 二进制名（启动时由 pickIptablesBackendForVersion 探测后更新）。
+// Alpine 3.13+ 的 `iptables` 包默认指向 nft 后端；群晖 DSM 4.x 内核 / 部分老 NAS 内核
+// 上 nft 子系统初始化即失败（`Could not fetch rule set generation id`），整个 ipset/iptables
+// 路径都用不了 —— 必须切换到 `iptables-legacy`（前提是镜像装了 `iptables-legacy` 包）。
+// 这里只做"探测+切换"，不自动 apk add（违反零运维原则）；缺包时给用户明确指引。
+const iptablesBinaries = {
+    v4: 'iptables',
+    v6: 'ip6tables'
+}
+
+/**
+ * 在 iptables/ipset 子进程报错文本里识别 iptables-nft 后端在老内核（Synology DSM 4.x
+ * 内核 / 部分 NAS 固件）下的特征错误，给用户一个可操作的修复路径。
+ * 命中任意一条特征就在日志里追加"切到 legacy 后端"的建议，不命中则保持原错误信息。
+ *
+ * 这些特征都来自实战日志：
+ *   `nf_tables`                                — iptables-nft 后端 banner
+ *   `Could not fetch rule set generation id`   — nft 内核子系统未初始化好
+ *   `Extension set revision 0 not supported`   — xt_set 内核模块缺失/版本不匹配
+ *   `Couldn't load match 'set'`                — 同上，老 ip6tables 报错形态
+ *   `missing kernel module`                    — iptables 兜底提示
+ */
+function looksLikeNftBackendIssue(err) {
+    const text = `${err && err.stderr || ''}\n${err && err.message || ''}`
+    return /nf_tables|generation id|Extension set|missing kernel module|Couldn't load match/i.test(text)
+}
+
+function logIptablesBackendHint() {
+    honsole.error('诊断：错误信号疑似 iptables-nft 后端 / xt_set 内核模块不兼容（常见于 Synology DSM 4.x 等老内核）。')
+    honsole.error('修复：在镜像里安装 iptables-legacy 后 aria2b 会自动探测并切换：')
+    honsole.error('      apk add --no-cache iptables-legacy ip6tables-legacy')
+}
+
+/**
+ * 探测某个 iptables 二进制能否在当前内核上工作。
+ *
+ * 采用 `bin -L INPUT -n` 作为最小探针：
+ *   - 不依赖任何 ipset 或扩展模块，能列规则就说明 backend 本身能跑通
+ *   - nft 后端在老内核上会在这步就报 `Could not fetch rule set generation id`
+ *   - legacy 后端在新内核上也能跑（兼容性最好）
+ *
+ * `-n` 跳过反向 DNS 解析，避免容器在没有 DNS 时阻塞 30s+。
+ */
+async function probeIptablesBinary(bin) {
+    await runtime.execFile(bin, ['-L', 'INPUT', '-n'])
+}
+
+/**
+ * 给指定 version 选一个能用的 iptables 二进制。
+ *
+ * 候选顺序：默认（`iptables` / `ip6tables`，可能是 nft 也可能是 legacy 看 alpine 版本）
+ *           → 显式 legacy（`iptables-legacy` / `ip6tables-legacy`，需要 iptables-legacy 包）。
+ *
+ * 默认能用 → 不切换；默认坏 + legacy 能用 → 切到 legacy 并 log；都不行 → 返回 false。
+ * 不会抛错 —— 上层决定 IPv4 致命还是 IPv6 软降级。
+ */
+async function pickIptablesBackendForVersion(version) {
+    const isV6 = version === 6
+    const defaultBin = isV6 ? 'ip6tables' : 'iptables'
+    const legacyBin  = isV6 ? 'ip6tables-legacy' : 'iptables-legacy'
+    const key = isV6 ? 'v6' : 'v4'
+
+    let defaultErr = null
+    try {
+        await probeIptablesBinary(defaultBin)
+        iptablesBinaries[key] = defaultBin
+        return true
+    } catch (e) {
+        defaultErr = e
+        // 默认探测失败的两种情况都试 legacy 兜底：
+        //   1. 二进制不存在（ENOENT）—— 不太可能，但保留
+        //   2. nft 后端实际工作不了（typical 群晖 DSM 4.x）
+        // 非 nft 错误（例如 NET_ADMIN 缺失导致权限报错）也试一下 legacy，
+        // 因为 legacy 也会在同样原因下失败，那时统一返回 false 给上层提示。
+    }
+
+    try {
+        await probeIptablesBinary(legacyBin)
+        iptablesBinaries[key] = legacyBin
+        honsole.log(`IPv${version} iptables 后端切换到 ${legacyBin}（默认 ${defaultBin} 在此内核不可用：${sanitizeError(defaultErr)}）`)
+        return true
+    } catch (legacyErr) {
+        honsole.warn(`IPv${version} iptables 探测失败：${defaultBin} 报 "${sanitizeError(defaultErr)}"，${legacyBin} 报 "${sanitizeError(legacyErr)}"`)
+        if (looksLikeNftBackendIssue(defaultErr) || looksLikeNftBackendIssue(legacyErr)) {
+            logIptablesBackendHint()
+        }
+        return false
+    }
+}
+
 async function flushIptablesIpset(version) {
-    const iptables = version === 6 ? 'ip6tables' : 'iptables'
+    const iptables = version === 6 ? iptablesBinaries.v6 : iptablesBinaries.v4
     const setName = version === 6 ? IPSET_NAME_V6 : IPSET_NAME_V4
     try {
         // 删除旧规则与 ipset；首次运行没有这些是正常的，吞错误
@@ -491,10 +582,11 @@ async function flushIptablesIpset(version) {
         await runtime.execFile('ipset', createArgs)
         await runtime.execFile(iptables, ['-I', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP'])
 
-        honsole.log(`已初始化 ${setName}（IPv${version}）`)
+        honsole.log(`已初始化 ${setName}（IPv${version}，使用 ${iptables}）`)
     } catch (e) {
         honsole.error(`初始化 ${setName} 失败：${sanitizeError(e)}`)
         honsole.error('请确认：容器具备 NET_ADMIN，已安装 iptables/ipset，且内核已加载对应模块')
+        if (looksLikeNftBackendIssue(e)) logIptablesBackendHint()
         throw e
     }
 }
@@ -508,18 +600,77 @@ async function flushIptablesIpset(version) {
  * 不存在则补 `-I`。docker alpine 上 -C 是标准选项，行为稳定。
  */
 async function ensureIptablesRule(version) {
-    const iptables = version === 6 ? 'ip6tables' : 'iptables'
+    const iptables = version === 6 ? iptablesBinaries.v6 : iptablesBinaries.v4
     const setName = version === 6 ? IPSET_NAME_V6 : IPSET_NAME_V4
     const ruleArgs = ['INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP']
     try {
         await runtime.execFile(iptables, ['-C', ...ruleArgs])
         return false   // 已存在，无需补装
     } catch (_) {
-        // -C 在规则不存在时退出码非 0；这是预期分支，继续补装
+        // -C 在规则不存在时退出码非 0；这是预期分支，继续补装。
+        // 在 iptables-nft + 老内核上 -C 也会因 "Could not fetch rule set generation id" 抛错；
+        // 那种情况后续的 -I 也会失败并抛出更明确的 nft 信号，由 initial() 的 IPv6 try/catch
+        // 决定降级/退出，这里不必区分 -C 失败的根因。
     }
-    await runtime.execFile(iptables, ['-I', ...ruleArgs])
+    try {
+        await runtime.execFile(iptables, ['-I', ...ruleArgs])
+    } catch (e) {
+        honsole.error(`补装 ${iptables} 规则（${setName}）失败：${sanitizeError(e)}`)
+        if (looksLikeNftBackendIssue(e)) logIptablesBackendHint()
+        throw e
+    }
     honsole.log(`已补装 ${iptables} 规则（${setName} 引用，前次启动可能被中断）`)
     return true
+}
+
+/**
+ * 启动阶段环境致命错误（IPv4 后端不可用 / ipset 缺失 等）时进入"空闲模式"。
+ *
+ * 不变量 #15：进程必须保持存活，绝不 process.exit。
+ *
+ * aria2b 在 docker-aria2 镜像里是 s6-overlay v2 的一个 service，s6 默认会无限重启
+ * 退出的 service —— 一旦 aria2b 因环境问题（群晖 DSM 老内核 + iptables-nft 不兼容、
+ * 缺 NET_ADMIN、ipset 二进制缺失等）crash，s6 立刻拉起，每 1-2 秒一次循环，导致：
+ *   1. 容器日志被淹没（每次重启刷出几十行错误）
+ *   2. 占满 CPU 和 fork 配额，拖慢同容器里的 aria2c
+ *   3. 用户没法看到真正的修复指引，因为它被滚动日志冲掉
+ *
+ * 空闲模式：进程不退出，只保留一个 refed setInterval 当作"心跳"让事件循环 alive，
+ * 不再执行任何 ipset/iptables 操作。aria2c 主服务不受影响。
+ * 每小时打一次提醒日志告诉用户问题仍未修复 —— 避免日志膨胀，又不让人遗忘。
+ */
+function runIdleMode(reason) {
+    if (idleHeartbeat) return   // 防止重复进入
+
+    // `--flush` 是一次性 CLI 维护命令（手动跑，不是 s6 service），失败时应该 exit 非 0
+    // 让调用者立刻知道，而不是静默保活让用户怀疑命令卡死。runIdleMode 只服务于 s6 长期托管路径。
+    if (argv && argv.flush) {
+        honsole.error(`--flush 失败：${reason}`)
+        process.exit(1)
+        return   // 测试里 process.exit 被 mock 时让函数提前结束，避免继续装 idleHeartbeat
+    }
+
+    honsole.error('aria2b 进入空闲模式（保持进程存活避免 s6-overlay 反复重启容器服务）。')
+    honsole.error(`原因：${reason}`)
+    honsole.error('当前不会做任何 ipset/iptables 操作；aria2c / AriaNg 等同容器服务不受影响。')
+    honsole.error('修复后请重启容器。常见修复：在 Dockerfile 增加 `apk add --no-cache iptables-legacy ip6tables-legacy`。')
+
+    // idle mode 可能在 cron 运行期间被 uncaughtException 触发：必须立刻停掉调度循环，
+    // 否则 cron 会在 idleHeartbeat 装好后继续每 N 秒跑一次，徒增 RPC / 子进程开销。
+    // scheduleNext() 同样检查 idleHeartbeat 防止重新装上 scanTimer。
+    if (scanTimer) { clearTimeout(scanTimer); scanTimer = null }
+    // 主动 destroy rpcClient：让飞行中的 RPC 立刻 ECONNRESET 收尾，避免 cronInflight
+    // 在 idle 启动后还卡 30s 才解开。与 SIGTERM stop() 的清理路径语义一致。
+    if (rpcClient && typeof rpcClient.destroy === 'function') {
+        try { rpcClient.destroy() } catch (_) { /* ignore */ }
+    }
+
+    const HOUR = 60 * 60 * 1000
+    idleHeartbeat = setInterval(() => {
+        // 不 unref：CLAUDE.md 第 1 条不变量说事件循环里必须有 refed handle，
+        // 否则 Node 会在 keep-alive 池超时后静默 exit(0) → s6 重启 → crash-loop 复发。
+        honsole.error(`aria2b 仍处于空闲模式（${reason}）—— 请修复后重启容器`)
+    }, HOUR)
 }
 
 /**
@@ -704,6 +855,10 @@ function backoffDelay() {
 
 function scheduleNext() {
     if (shuttingDown) return
+    // idle mode 一旦启用，cron 永久停止调度 —— idleHeartbeat 是 idle 状态的 source of truth。
+    // 否则 cron 内部抛 uncaughtException 触发 runIdleMode 后，下一轮 scheduleNext 还会装回
+    // scanTimer，每 N 秒空跑一次拖资源。
+    if (idleHeartbeat) return
     // 不要对 scanTimer 调 unref：
     // Node 的 http.Agent keep-alive 空闲 socket 自带 unref，cron 跑完后没有任何
     // refed handle，如果再把 scanTimer 也 unref，事件循环会立刻判定无事可做、
@@ -908,6 +1063,7 @@ function installSignalHandlers() {
         shuttingDown = true
         honsole.log(`收到 ${signal}，等待当前扫描结束后退出`)
         if (scanTimer) { clearTimeout(scanTimer); scanTimer = null }
+        if (idleHeartbeat) { clearInterval(idleHeartbeat); idleHeartbeat = null }
         // 主动销毁 rpcClient agent：让飞行中的 RPC 立刻 ECONNRESET 收尾，
         // cron 会进 catch 分支并 return。否则要等最长 30s 的 RPC 超时
         // 才能 await cronInflight 解开。容器关停从秒级降到毫秒级。
@@ -922,13 +1078,16 @@ function installSignalHandlers() {
     process.on('SIGTERM', () => { stop('SIGTERM').catch(() => process.exit(0)) })
     process.on('SIGINT',  () => { stop('SIGINT').catch(()  => process.exit(0)) })
     process.on('SIGHUP',  () => { stop('SIGHUP').catch(()  => process.exit(0)) })
+    // uncaughtException / unhandledRejection 是程序内部 bug，不是环境问题；
+    // 进入 idle mode 保活（s6-overlay v2 反复重启会拖垮容器；让 aria2b 静默存活，
+    // 同容器里 aria2c / AriaNg 继续工作；用户能从日志里看到 stack trace 修 bug）。
     process.on('uncaughtException', e => {
         try { honsole.error('uncaughtException:', sanitizeError(e)) } catch (_) {}
-        process.exit(1)
+        if (!idleHeartbeat) runIdleMode(`uncaughtException: ${sanitizeError(e)}`)
     })
     process.on('unhandledRejection', e => {
         try { honsole.error('unhandledRejection:', sanitizeError(e)) } catch (_) {}
-        process.exit(1)
+        if (!idleHeartbeat) runIdleMode(`unhandledRejection: ${sanitizeError(e)}`)
     })
 }
 
@@ -966,25 +1125,56 @@ async function initial() {
     } catch (e) {
         honsole.error(`执行 ipset save 失败：${sanitizeError(e)}`)
         honsole.error('请确认容器具备 NET_ADMIN 能力且已安装 ipset')
-        process.exit(1)
+        return runIdleMode(`ipset 不可用：${sanitizeError(e)}`)
+    }
+
+    // 探测 iptables 后端：Alpine 3.13+ 的 `iptables` 包默认指向 nft 后端，
+    // 在群晖 DSM 4.x 老内核 / 部分老 NAS 上 nft 子系统初始化即失败，整个 iptables 路径都用不了。
+    // 这里探测默认能否工作，不行就尝试切到 `iptables-legacy`（前提是镜像装了 iptables-legacy 包）。
+    //   IPv4 失败 → 进入空闲模式（绝不 process.exit，否则会触发 s6 crash-loop 拖死容器）
+    //   IPv6 失败 → 软降级：仅 IPv4 仍然能干活，给用户明确提示
+    if (!await pickIptablesBackendForVersion(4)) {
+        return runIdleMode('IPv4 iptables 后端不可用（默认 nft 与 iptables-legacy 都无法工作）。修复：在镜像里装 iptables-legacy 包；若已装请检查容器 NET_ADMIN capability 与内核 ipset 模块')
+    }
+    if (config.ipv6 && !await pickIptablesBackendForVersion(6)) {
+        honsole.warn('IPv6 iptables 后端不可用，自动降级为仅 IPv4 模式继续运行（IPv4 拦截不受影响）。')
+        honsole.warn('若需启用 IPv6 拦截，请在镜像里装 iptables-legacy + ip6tables-legacy；')
+        honsole.warn('若本就不需要 IPv6，可在 aria2.conf 设 disable-ipv6=true 消除此警告。')
+        config.ipv6 = false
     }
 
     let v4Flushed = false
     let v6Flushed = false
-    if (argv.flush || !hasIpset(ipsetSave, IPSET_NAME_V4)) {
-        await flushIptablesIpset(4)
-        v4Flushed = true
-    } else {
-        // set 已存在 → 跳过 flush 保留已封 IP，但仍需幂等检查 iptables 规则在不在，
-        // 防止前次启动被打断后规则缺失、aria2b 跑空转。
-        await ensureIptablesRule(4)
-    }
-    if (config.ipv6) {
-        if (argv.flush || !hasIpset(ipsetSave, IPSET_NAME_V6)) {
-            await flushIptablesIpset(6)
-            v6Flushed = true
+    try {
+        if (argv.flush || !hasIpset(ipsetSave, IPSET_NAME_V4)) {
+            await flushIptablesIpset(4)
+            v4Flushed = true
         } else {
-            await ensureIptablesRule(6)
+            // set 已存在 → 跳过 flush 保留已封 IP，但仍需幂等检查 iptables 规则在不在，
+            // 防止前次启动被打断后规则缺失、aria2b 跑空转。
+            await ensureIptablesRule(4)
+        }
+    } catch (e) {
+        // 探测通过但 flush/ensure 阶段失败（典型场景：xt_set 模块在该内核完全残缺，
+        // 即便 legacy 后端也救不了）→ 同样进入空闲模式而不是 crash。
+        return runIdleMode(`IPv4 ipset/iptables 初始化失败：${sanitizeError(e)}`)
+    }
+    // IPv6 setup 即便后端探测通过，xt_set 实际加载 `-m set` 仍可能失败（内核 xt_set 模块
+    // 残缺）。这里再套一层 try/catch 兜底：v6 在 flush/ensure 阶段抛错时同样软降级为仅 IPv4。
+    // 不变量：这与上面的探测降级共用 `config.ipv6=false` 信号；下游 cron / blockIp / sync
+    // 都已经看 config.ipv6 决定是否走 v6 路径。
+    if (config.ipv6) {
+        try {
+            if (argv.flush || !hasIpset(ipsetSave, IPSET_NAME_V6)) {
+                await flushIptablesIpset(6)
+                v6Flushed = true
+            } else {
+                await ensureIptablesRule(6)
+            }
+        } catch (_e) {
+            honsole.warn('IPv6 ipset/iptables 初始化失败（后端探测通过但 xt_set 实际加载失败），自动降级为仅 IPv4 模式。')
+            config.ipv6 = false
+            v6Flushed = false   // 没初始化过的 set 别 sync，避免假装"已封"
         }
     }
     if (argv.flush) {
@@ -1016,7 +1206,9 @@ async function initial() {
 if (require.main === module) {
     initial().catch(e => {
         try { honsole.error('启动失败：', sanitizeError(e)) } catch (_) {}
-        process.exit(1)
+        // 启动阶段未捕获异常（initial 内部应该都 try 过了，这里是兜底）：进入 idle mode
+        // 而不是 exit，避免 s6-overlay v2 反复重启容器服务（参见 runIdleMode 注释）。
+        runIdleMode(`启动异常：${sanitizeError(e)}`)
     })
 }
 
@@ -1040,7 +1232,11 @@ module.exports = {
         // CLI
         parseArgv, applyCliConfig, applyNoVerify, loadConfigFromAria2File,
         // ipset / iptables
+        iptablesBinaries,
+        looksLikeNftBackendIssue,
+        probeIptablesBinary, pickIptablesBackendForVersion,
         flushIptablesIpset, ensureIptablesRule, blockIp,
+        runIdleMode,
         // RPC
         httpJsonPost,
         // cron
@@ -1050,9 +1246,16 @@ module.exports = {
             blockedIps.clear()
             peerState.clear()
             Object.assign(config, defaultConfig())
+            // 测试期间各用例可能伪造 iptables 后端切换；统一重置回默认二进制，
+            // 避免上一个用例污染下一个用例的断言（spy.calls 期望命中 'iptables'）。
+            iptablesBinaries.v4 = 'iptables'
+            iptablesBinaries.v6 = 'ip6tables'
+            // idle mode 在测试里被触发会留下 refed setInterval，会让 node --test 不退出。
+            if (idleHeartbeat) { clearInterval(idleHeartbeat); idleHeartbeat = null }
             consecutiveFailures = 0
             shuttingDown = false
         },
+        _getIdleHeartbeat() { return idleHeartbeat },
         _getFailures() { return consecutiveFailures },
         _setFailures(n) { consecutiveFailures = n },
         _getScanTimer() { return scanTimer },
