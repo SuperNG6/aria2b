@@ -82,12 +82,20 @@ const runtime = {
 // logger
 // ============================================================================
 
+function pad2(n) {
+    return String(n).padStart(2, '0')
+}
+
+function formatLocalTimestamp(d = new Date()) {
+    return `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+}
+
 const honsole = {
     dev(...a) { if (process.env.DEV) console.log('[aria2b]', ...a) },
     log(...a) { console.log('[aria2b]', ...a) },
     logt(...a) {
         if (process.env.HIDE_TIME_PREFIX) console.log('[aria2b]', ...a)
-        else console.log('[aria2b]', new Date().toLocaleString('zh'), ...a)
+        else console.log('[aria2b]', formatLocalTimestamp(), ...a)
     },
     error(...a) { console.error('[aria2b]', ...a) },
     warn(...a) { console.warn('[aria2b]', ...a)  }
@@ -1233,6 +1241,7 @@ module.exports = {
         defaultConfig,
         // helpers
         decodePercentEncodedString, decodeClient, countOnes,
+        formatLocalTimestamp,
         parseList, parsePositiveInteger, parseBoolean,
         hasUnknownKeyword, keywordMatches,
         peerStateKey, parseConfigLine, readTlsMaterial,
