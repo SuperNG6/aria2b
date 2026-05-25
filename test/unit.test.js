@@ -6,6 +6,7 @@ const { _internal } = require('../app.js')
 
 const {
     decodePercentEncodedString, decodeClient, countOnes,
+    formatLocalTimestamp,
     parseList, parsePositiveInteger, parseBoolean,
     hasUnknownKeyword, keywordMatches,
     peerStateKey, parseConfigLine,
@@ -19,6 +20,12 @@ const {
 } = _internal
 
 test.beforeEach(() => _reset())
+
+// ---------- formatLocalTimestamp ----------
+test('formatLocalTimestamp: 使用系统本地时区输出固定补零格式', () => {
+    assert.equal(formatLocalTimestamp(new Date(2026, 4, 25, 0, 12, 50)), '2026/05/25 00:12:50')
+    assert.equal(formatLocalTimestamp(new Date(2026, 10, 5, 13, 2, 9)), '2026/11/05 13:02:09')
+})
 
 // ---------- parseList ----------
 test('parseList: 切分、去空白、过滤空项', () => {

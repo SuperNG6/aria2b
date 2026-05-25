@@ -4,6 +4,8 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来
 
+> **v2.2.3**：日志时间前缀改为固定本地格式 `YYYY/MM/DD HH:mm:ss`，例如 `2026/05/25 00:12:50`，避免不同系统 locale 输出不一致。
+>
 > **v2.2.2**：修正 Alpine 3.23 legacy iptables 安装提示：`iptables-legacy` 包已经提供 `ip6tables-legacy`，不要安装不存在的 `ip6tables-legacy` 包；优化运行日志，去掉 `Blocked` / `started!` / "累犯" / "idle mode" 等不直观话术。
 >
 > **v2.2.1**：启动同步 ipset 状态时给 `ipset save` 配置更大的 stdout buffer，避免长期运行黑名单较大时触发 Node 默认 1MB `maxBuffer`；`system.multicall` 子调用 fault / 结果缺失会被视为部分失败，不清理 `peerState`，避免 noprogress 累计被误清。防火墙行为面不变，仍只维护 `bt_blacklist` / `bt_blacklist6` 及对应 INPUT 规则。
@@ -130,6 +132,7 @@ aria2b支持寄生配置。会读取aria2本体的配置文件来找 aria2 RPC �
 
 环境变量：
 - `DEV=1` 输出 debug 日志
+- 默认日志时间前缀使用系统时区，格式为 `YYYY/MM/DD HH:mm:ss`，例如 `2026/05/25 00:12:50`
 - `HIDE_TIME_PREFIX=1` 日志不带时间前缀（外部 logger/journalctl 通常自己加时间，避免重复）
 
 > **_注意：_** ⚠️寄生配置**不**支持结尾带 # 注释
