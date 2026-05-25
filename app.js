@@ -1241,7 +1241,8 @@ async function pickIptablesBackendForVersion(version) {
     try {
         await probeIptablesBinary(legacyBin)
         iptablesBinaries[key] = legacyBin
-        honsole.log(`IPv${version} iptables 后端切换到 ${legacyBin}（默认 ${defaultBin} 在此内核不可用：${sanitizeError(defaultErr)}）`)
+        honsole.log(`IPv${version} iptables 后端已自动切换到 ${legacyBin}（默认 ${defaultBin} 不兼容当前内核）`)
+        honsole.dev(`IPv${version} iptables 默认后端错误详情：${sanitizeError(defaultErr)}`)
         return true
     } catch (legacyErr) {
         honsole.warn(`IPv${version} iptables 探测失败：${defaultBin} 报 "${sanitizeError(defaultErr)}"，${legacyBin} 报 "${sanitizeError(legacyErr)}"`)
