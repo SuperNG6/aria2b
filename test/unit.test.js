@@ -6,6 +6,7 @@ const { _internal } = require('../app.js')
 
 const {
     decodePercentEncodedString, decodeClient, countOnes,
+    getPeerName, detectPeerClient,
     formatLocalTimestamp,
     parseList, parsePositiveInteger, parseBoolean,
     hasUnknownKeyword, keywordMatches,
@@ -73,8 +74,10 @@ test('decodePercentEncodedString: 正常 / 异常 / 空', () => {
     assert.equal(decodePercentEncodedString(null), 'Unknown')
     assert.equal(decodePercentEncodedString('-XL0012-abc'), '-XL0012-abc')
     assert.equal(decodePercentEncodedString('A%2DB'), 'A-B')
-    // %ZZ 不是合法 hex，原样保留
+    // 非完整 hex 的 percent escape 必须原样保留，避免 parseInt('2Z', 16) 宽松解成控制字符
     assert.equal(decodePercentEncodedString('A%ZZB'), 'A%ZZB')
+    assert.equal(decodePercentEncodedString('A%2ZB'), 'A%2ZB')
+    assert.equal(decodePercentEncodedString('%0G'), '%0G')
 })
 
 // ---------- decodeClient ----------
@@ -99,6 +102,28 @@ test('countOnes: 数 bitfield 的 1 个数（per-nibble popcount）', () => {
     // 巨长 hex（旧版 BigInt 在某些场景下会出问题）
     const longHex = 'ff'.repeat(1000)
     assert.equal(countOnes(longHex), 8000)
+})
+
+// ---------- getPeerName ----------
+test('getPeerName: 内置 peerId 识别保留 @huggycn/bittorrent-peerid 行为', () => {
+    assert.deepEqual(getPeerName('-XL0012-123456789012'), {
+        origin: 'XL',
+        client: '迅雷在线 (Xunlei)',
+        version: '0.0.1.2'
+    })
+    assert.deepEqual(getPeerName('-XF0000-123456789012'), {
+        origin: 'XF',
+        client: 'Xfplay',
+        version: null
+    })
+    assert.deepEqual(getPeerName('-QN1234-123456789012'), { client: 'unknown' })
+    assert.deepEqual(getPeerName('short'), { client: 'unknown' })
+    assert.throws(() => getPeerName(null), /Invalid peerId/)
+})
+
+test('detectPeerClient: 识别异常时降级为 unknown，避免扫描循环中断', () => {
+    assert.deepEqual(detectPeerClient('-XL0012-123456789012'), getPeerName('-XL0012-123456789012'))
+    assert.deepEqual(detectPeerClient(null), { client: 'unknown', origin: '', version: '' })
 })
 
 // ---------- hasUnknownKeyword / keywordMatches ----------

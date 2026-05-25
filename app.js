@@ -15,7 +15,6 @@ const http = require('http')
 const https = require('https')
 const child_process = require('child_process')
 const { promisify } = require('util')
-const getPeerName = require('@huggycn/bittorrent-peerid')
 
 // ============================================================================
 // 常量
@@ -41,6 +40,667 @@ const DEFAULT_TIMEOUT_SECONDS = 86400
 const PEER_MIN_UPLOAD_BYTES_PER_SEC = 1024
 const IPSET_NAME_V4 = 'bt_blacklist'
 const IPSET_NAME_V6 = 'bt_blacklist6'
+
+// ============================================================================
+// BitTorrent peerId 识别
+// ============================================================================
+
+/*!
+ * Portions of this file are derived from @huggycn/bittorrent-peerid@1.3.4,
+ * based on bittorrent-peerid: https://github.com/webtorrent/bittorrent-peerid
+ *
+ * aria2b 依赖其 fork 增加的 origin 字段做封禁关键词匹配；保持内置可以减少
+ * 运行时供应链暴露面，并继续满足单文件、自包含分发约束。
+ *
+ * The MIT License (MIT)
+ *
+ * Copyright (c) Travis Fischer and WebTorrent, LLC
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+const peerIdUtils = {
+  isAzStyle(peerId) {
+    if (peerId.charAt(0) !== '-') return false
+    if (peerId.charAt(7) === '-') return true
+
+    /**
+     * Hack for FlashGet - it doesn't use the trailing dash.
+     * Also, LH-ABC has strayed into "forgetting about the delimiter" territory.
+     *
+     * In fact, the code to generate a peer ID for LH-ABC is based on BitTornado's,
+     * yet tries to give an Az style peer ID... oh dear.
+     *
+     * BT Next Evolution seems to be in the same boat as well.
+     *
+     * KTorrent 3 appears to use a dash rather than a final character.
+     */
+    if (['FG', 'LH', 'NE', 'KT', 'SP'].includes(peerId.substring(1, 3))) return true
+
+    return false
+  },
+
+  /**
+   * Checking whether a peer ID is Shadow style or not is a bit tricky.
+   *
+   * The BitTornado peer ID convention code is explained here:
+   *   http://forums.degreez.net/viewtopic.php?t=7070
+   *
+   * The main thing we are interested in is the first six characters.
+   * Although the other characters are base64 characters, there's no
+   * guarantee that other clients which follow that style will follow
+   * that convention (though the fact that some of these clients use
+   * BitTornado in the core does blur the lines a bit between what is
+   * "style" and what is just common across clients).
+   *
+   * So if we base it on the version number information, there's another
+   * problem - there isn't the use of absolute delimiters (no fixed dash
+   * character, for example).
+   *
+   * There are various things we can do to determine how likely the peer
+   * ID is to be of that style, but for now, I'll keep it to a relatively
+   * simple check.
+   *
+   * We'll assume that no client uses the fifth version digit, so we'll
+   * expect a dash. We'll also assume that no client has reached version 10
+   * yet, so we expect the first two characters to be "letter,digit".
+   *
+   * We've seen some clients which don't appear to contain any version
+   * information, so we need to allow for that.
+   */
+  isShadowStyle(peerId) {
+    if (peerId.charAt(5) !== '-') return false
+    if (!isLetter(peerId.charAt(0))) return false
+    if (!(isDigit(peerId.charAt(1)) || peerId.charAt(1) === '-')) return false
+
+    // Find where the version number string ends.
+    let lastVersionNumberIndex = 4
+    for (; lastVersionNumberIndex > 0; lastVersionNumberIndex--) {
+      if (peerId.charAt(lastVersionNumberIndex) !== '-') break
+    }
+
+    // For each digit in the version string, check if it is a valid version identifier.
+    for (let i = 1; i <= lastVersionNumberIndex; i++) {
+      const c = peerId.charAt(i)
+      if (c === '-') return false
+      if (isAlphaNumeric(c) === null) return false
+    }
+
+    return true
+  },
+
+  isMainlineStyle(peerId) {
+    /**
+     * One of the following styles will be used:
+     *   Mx-y-z--
+     *   Mx-yy-z-
+     */
+    return peerId.charAt(2) === '-' && peerId.charAt(7) === '-' &&
+      (peerId.charAt(4) === '-' || peerId.charAt(5) === '-')
+  },
+
+  isPossibleSpoofClient(peerId) {
+    return peerId.endsWith('UDP0') || peerId.endsWith('HTTPBT')
+  },
+
+  decodeNumericValueOfByte,
+
+  getAzStyleVersionNumber(peerId, version) {
+    if (typeof version === 'function') {
+      return version(peerId)
+    }
+    return null
+  },
+
+  getShadowStyleVersionNumber(peerId) {
+    // TODO
+    return null
+  },
+
+  decodeBitSpiritClient(peerId, buffer) {
+    if (peerId.substring(2, 4) !== 'BS') return null
+    let version = `${buffer[1]}`
+    if (version === '0') version = 1
+
+    return {
+      origin: peerId.substring(2, 4),
+      client: 'BitSpirit',
+      version
+    }
+  },
+
+  decodeBitCometClient(peerId, buffer) {
+    let modName = ''
+    if (peerId.startsWith('exbc')) modName = ''
+    else if (peerId.startsWith('FUTB')) modName = '(Solidox Mod)'
+    else if (peerId.startsWith('xUTB')) modName = '(Mod 2)'
+    else return null
+
+    const isBitlord = (peerId.substring(6, 10) === 'LORD')
+
+    // Older versions of BitLord are of the form x.yy, whereas new versions (1 and onwards),
+    // are of the form x.y. BitComet is of the form x.yy
+    const clientName = (isBitlord) ? 'BitLord' : 'BitComet'
+    const majVersion = decodeNumericValueOfByte(buffer[4])
+    const minVersionLength = (isBitlord && majVersion !== '0' ? 1 : 2)
+
+    return {
+      origin: clientName + (modName ? ` ${modName}` : ''),
+      client: clientName + (modName ? ` ${modName}` : ''),
+      version: `${majVersion}.${decodeNumericValueOfByte(buffer[5], minVersionLength)}`
+    }
+  },
+
+  identifyAwkwardClient(peerId, buffer) {
+    let firstNonZeroIndex = 20
+    let i
+
+    for (i = 0; i < 20; ++i) {
+      if (buffer[i] > 0) {
+        firstNonZeroIndex = i
+        break
+      }
+    }
+
+    // Shareaza check
+    if (firstNonZeroIndex === 0) {
+      let isShareaza = true
+      for (i = 0; i < 16; ++i) {
+        if (buffer[i] === 0) {
+          isShareaza = false
+          break
+        }
+      }
+
+      if (isShareaza) {
+        for (i = 16; i < 20; ++i) {
+          if (buffer[i] !== (buffer[i % 16] ^ buffer[15 - (i % 16)])) {
+            isShareaza = false
+            break
+          }
+        }
+
+        if (isShareaza) return { client: 'Shareaza' }
+      }
+    }
+
+    if (firstNonZeroIndex === 9 && buffer[9] === 3 && buffer[10] === 3 && buffer[11] === 3) { return { origin: 'I2PSnark', client: 'I2PSnark' } }
+
+    if (firstNonZeroIndex === 12 && buffer[12] === 97 && buffer[13] === 97) { return { origin: 'Experimental', client: 'Experimental', version: '3.2.1b2' } }
+
+    if (firstNonZeroIndex === 12 && buffer[12] === 0 && buffer[13] === 0) { return { origin: 'Experimental', client: 'Experimental', version: '3.1' } }
+
+    if (firstNonZeroIndex === 12) { return { origin: 'Mainline', client: 'Mainline' } }
+
+    return null
+  }
+}
+
+//
+// Private helper functions for the public utility functions
+//
+
+function isDigit(s) {
+  const code = s.charCodeAt(0)
+  return code >= '0'.charCodeAt(0) && code <= '9'.charCodeAt(0)
+}
+
+function isLetter(s) {
+  const code = s.toLowerCase().charCodeAt(0)
+  return code >= 'a'.charCodeAt(0) && code <= 'z'.charCodeAt(0)
+}
+
+function isAlphaNumeric(s) {
+  return isDigit(s) || isLetter(s) || s === '.'
+}
+
+function decodeNumericValueOfByte(b, minDigits = 0) {
+  let result = `${b & 0xff}`
+  while (result.length < minDigits) { result = `0${result}` }
+  return result
+}
+
+/**
+ * Parses and returns the client type and version of a bittorrent peer id.
+ * Throws an exception if the peer id is invalid.
+ *
+ * @param {Buffer|string} peerId (as Buffer or hex/utf8 string)
+ */
+function getPeerName(peerId) {
+  let buffer
+
+  if (Buffer.isBuffer(peerId)) {
+    buffer = peerId
+  } else if (typeof peerId === 'string') {
+    buffer = Buffer.from(peerId, 'utf8')
+
+  } else {
+    throw new Error(`Invalid peerId must be Buffer or hex string: ${peerId}`)
+  }
+  peerId = buffer.toString('utf8')
+
+  let client = null
+  // If the client reuses parts of the peer ID of other peers, then try to determine this
+  // first (before we misidentify the client).
+  if (peerIdUtils.isPossibleSpoofClient(peerId)) {
+    if ((client = peerIdUtils.decodeBitSpiritClient(peerId, buffer))) return client
+    if ((client = peerIdUtils.decodeBitCometClient(peerId, buffer))) return client
+    return { client: 'BitSpirit?' }
+  }
+
+  // See if the client uses Az style identification
+  if (peerIdUtils.isAzStyle(peerId)) {
+    if ((client = getAzStyleClientName(peerId))) {
+      const version = getAzStyleClientVersion(client, peerId)
+
+      // Hack for fake ZipTorrent clients - there seems to be some clients
+      // which use the same identifier, but they aren't valid ZipTorrent clients
+      if (client.startsWith('ZipTorrent') && peerId.startsWith('bLAde', 8)) {
+        return {
+          client: 'Unknown [Fake: ZipTorrent]',
+          version
+        }
+      }
+
+      // BitTorrent 6.0 Beta currently misidentifies itself
+      if (client === '\u00B5Torrent' && version === '6.0 Beta') {
+        return {
+          client: 'Mainline',
+          version: '6.0 Beta'
+        }
+      }
+
+      // If it's the rakshasa libtorrent, then it's probably rTorrent
+      if (client.startsWith('libTorrent (Rakshasa)')) {
+        return {
+          client: `${client} / rTorrent*`,
+          version
+        }
+      }
+
+      return {
+        origin: peerId.substring(1, 3),
+        client,
+        version
+      }
+    }
+  }
+
+  // See if the client uses Shadow style identification
+  if (peerIdUtils.isShadowStyle(peerId)) {
+    if ((client = getShadowStyleClientName(peerId))) {
+      // TODO: handle shadow style client version numbers
+      return {
+        origin: peerId.substring(0, 1),
+        client
+      }
+    }
+  }
+
+  // See if the client uses Mainline style identification
+  if (peerIdUtils.isMainlineStyle(peerId)) {
+    if ((client = getMainlineStyleClientName(peerId))) {
+      // TODO: handle mainline style client version numbers
+      return {
+        origin: peerId.substring(0, 1),
+        client
+      }
+    }
+  }
+
+  // Check for BitSpirit / BitComet disregarding spoof mode
+  if ((client = peerIdUtils.decodeBitSpiritClient(peerId, buffer))) return client
+  if ((client = peerIdUtils.decodeBitCometClient(peerId, buffer))) return client
+
+  // See if the client identifies itself using a particular substring
+  const data = getSimpleClient(peerId)
+  if (data) {
+    client = data.client
+
+    // TODO: handle simple client version numbers
+    return {
+      origin: client,
+      client,
+      version: data.version
+    }
+  }
+
+  // See if client is known to be awkward / nonstandard
+  if ((client = peerIdUtils.identifyAwkwardClient(peerId, buffer))) {
+    return client
+  }
+
+  // TODO: handle unknown az-formatted and shadow-formatted clients
+  return { client: 'unknown' }
+}
+
+// Az style two byte code identifiers to real client name
+const azStyleClients = {}
+const azStyleClientVersions = {}
+
+// Shadow's style one byte code identifiers to real client name
+const shadowStyleClients = {}
+const shadowStyleClientVersions = {}
+
+// Mainline's new style uses one byte code identifiers too
+const mainlineStyleClients = {}
+
+// Clients with completely custom naming schemes
+const customStyleClients = []
+
+const VER_AZ_THREE_DIGITS = v => // "1.2.3"
+  `${v[0]}.${v[1]}.${v[2]}`
+const VER_AZ_DELUGE = v => {
+  const alphabet = 'ABCDE'
+  if (isNaN(v[2])) {
+    return `${v[0]}.${v[1]}.1${alphabet.indexOf(v[2])}`
+  }
+  return `${v[0]}.${v[1]}.${v[2]}`
+}
+const VER_AZ_THREE_DIGITS_PLUS_MNEMONIC = v => {
+  // "1.2.3 [4]"
+  let mnemonic = v[3]
+  if (mnemonic === 'B') {
+    mnemonic = 'Beta'
+  } else if (mnemonic === 'A') {
+    mnemonic = 'Alpha'
+  } else {
+    mnemonic = ''
+  }
+  return `${v[0]}.${v[1]}.${v[2]} ${mnemonic}`
+}
+const VER_AZ_FOUR_DIGITS = v => // "1.2.3.4"
+  `${v[0]}.${v[1]}.${v[2]}.${v[3]}`
+const VER_AZ_TWO_MAJ_TWO_MIN = v => // "12.34"
+  `${v[0] + v[1]}.${v[2]}${v[3]}`
+const VER_AZ_SKIP_FIRST_ONE_MAJ_TWO_MIN = v => // "2.34"
+  `${v[1]}.${v[2]}${v[3]}`
+const VER_AZ_KTORRENT_STYLE = '1.2.3=[RD].4'
+const VER_AZ_TRANSMISSION_STYLE = v => {
+  // "transmission"
+  if (v[0] === '0' && v[1] === '0' && v[2] === '0') {
+    return `0.${v[3]}`
+  } else if (v[0] === '0' && v[1] === '0') {
+    return `0.${v[2]}${v[3]}`
+  }
+  return `${v[0]}.${v[1]}${v[2]}${v[3] === 'Z' || v[3] === 'X' ? '+' : ''}`
+}
+const VER_AZ_WEBTORRENT_STYLE = v => {
+  // "webtorrent"
+  let version = ''
+  if (v[0] === '0') {
+    version += `${v[1]}.`
+  } else {
+    version += `${v[0]}${v[1]}.`
+  }
+  if (v[2] === '0') {
+    version += v[3]
+  } else {
+    version += `${v[2]}${v[3]}`
+  }
+  return version
+}
+const VER_AZ_THREE_ALPHANUMERIC_DIGITS = '2.33.4'
+const VER_NONE = 'NO_VERSION'
+
+function addAzStyle(id, client, version = VER_AZ_FOUR_DIGITS) {
+  azStyleClients[id] = client
+  azStyleClientVersions[client] = version
+}
+
+function addShadowStyle(id, client, version = VER_AZ_THREE_DIGITS) {
+  shadowStyleClients[id] = client
+  shadowStyleClientVersions[client] = version
+}
+
+function addMainlineStyle(id, client) {
+  mainlineStyleClients[id] = client
+}
+
+function addSimpleClient(client, version, id, position) {
+  if (typeof id === 'number' || typeof id === 'undefined') {
+    position = id
+    id = version
+    version = undefined
+  }
+
+  customStyleClients.push({
+    id,
+    client,
+    version,
+    position: position || 0
+  })
+}
+
+function getAzStyleClientName(peerId) {
+  return azStyleClients[peerId.substring(1, 3)]
+}
+
+function getShadowStyleClientName(peerId) {
+  return shadowStyleClients[peerId.substring(0, 1)]
+}
+
+function getMainlineStyleClientName(peerId) {
+  return mainlineStyleClients[peerId.substring(0, 1)]
+}
+
+function getSimpleClient(peerId) {
+  for (let i = 0; i < customStyleClients.length; ++i) {
+    const client = customStyleClients[i]
+
+    if (peerId.startsWith(client.id, client.position)) {
+      return client
+    }
+  }
+
+  return null
+}
+
+function getAzStyleClientVersion(client, peerId) {
+  const version = azStyleClientVersions[client]
+  if (!version) return null
+
+  return peerIdUtils.getAzStyleVersionNumber(peerId.substring(3, 7), version)
+}
+
+(() => {
+  // add known clients alphabetically
+  addAzStyle('A~', 'Ares', VER_AZ_THREE_DIGITS)
+  addAzStyle('AG', 'Ares', VER_AZ_THREE_DIGITS)
+  addAzStyle('AN', 'Ares', VER_AZ_FOUR_DIGITS)
+  addAzStyle('AR', 'Ares')// Ares is more likely than ArcticTorrent
+  addAzStyle('AV', 'Avicora')
+  addAzStyle('AX', 'BitPump', VER_AZ_TWO_MAJ_TWO_MIN)
+  addAzStyle('AT', 'Artemis')
+  addAzStyle('AZ', 'Vuze', VER_AZ_FOUR_DIGITS)
+  addAzStyle('BB', 'BitBuddy', '1.234')
+  addAzStyle('BC', 'BitComet', VER_AZ_SKIP_FIRST_ONE_MAJ_TWO_MIN)
+  addAzStyle('BE', 'BitTorrent SDK')
+  addAzStyle('BF', 'BitFlu', VER_NONE)
+  addAzStyle('BG', 'BTG', VER_AZ_FOUR_DIGITS)
+  addAzStyle('bk', 'BitKitten (libtorrent)')
+  addAzStyle('BR', 'BitRocket', '1.2(34)')
+  addAzStyle('BS', 'BTSlave')
+  addAzStyle('BT', 'BitTorrent', VER_AZ_THREE_DIGITS_PLUS_MNEMONIC)
+  addAzStyle('BW', 'BitWombat')
+  addAzStyle('BX', 'BittorrentX')
+  addAzStyle('CB', 'Shareaza Plus')
+  addAzStyle('CD', 'Enhanced CTorrent', VER_AZ_TWO_MAJ_TWO_MIN)
+  addAzStyle('CT', 'CTorrent', '1.2.34')
+  addAzStyle('DP', 'Propogate Data Client')
+  addAzStyle('DE', 'Deluge', VER_AZ_DELUGE)
+  addAzStyle('EB', 'EBit')
+  addAzStyle('ES', 'Electric Sheep', VER_AZ_THREE_DIGITS)
+  addAzStyle('FC', 'FileCroc')
+  addAzStyle('FG', 'FlashGet', VER_AZ_SKIP_FIRST_ONE_MAJ_TWO_MIN)
+  addAzStyle('FX', 'Freebox BitTorrent')
+  addAzStyle('FT', 'FoxTorrent/RedSwoosh')
+  addAzStyle('GR', 'GetRight', '1.2')
+  addAzStyle('GS', 'GSTorrent')// TODO: Format is v"abcd"
+  addAzStyle('HL', 'Halite', VER_AZ_THREE_DIGITS)
+  addAzStyle('HN', 'Hydranode')
+  addAzStyle('KG', 'KGet')
+  addAzStyle('KT', 'KTorrent', VER_AZ_KTORRENT_STYLE)
+  addAzStyle('LC', 'LeechCraft')
+  addAzStyle('LH', 'LH-ABC')
+  addAzStyle('LK', 'linkage', VER_AZ_THREE_DIGITS)
+  addAzStyle('LP', 'Lphant', VER_AZ_TWO_MAJ_TWO_MIN)
+  addAzStyle('LT', 'libtorrent (Rasterbar)', VER_AZ_THREE_ALPHANUMERIC_DIGITS)
+  addAzStyle('lt', 'libTorrent (Rakshasa)', VER_AZ_THREE_ALPHANUMERIC_DIGITS)
+  addAzStyle('LW', 'LimeWire', VER_NONE)// The "0001" bytes found after the LW commonly refers to the version of the BT protocol implemented. Documented here: http://www.limewire.org/wiki/index.php?title=BitTorrentRevision
+  addAzStyle('MO', 'MonoTorrent')
+  addAzStyle('MP', 'MooPolice', VER_AZ_THREE_DIGITS)
+  addAzStyle('MR', 'Miro')
+  addAzStyle('MT', 'MoonlightTorrent')
+  addAzStyle('NE', 'BT Next Evolution', VER_AZ_THREE_DIGITS)
+  addAzStyle('NX', 'Net Transport')
+  addAzStyle('OS', 'OneSwarm', VER_AZ_FOUR_DIGITS)
+  addAzStyle('OT', 'OmegaTorrent')
+  addAzStyle('PC', 'CacheLogic', '12.3-4')
+  addAzStyle('PT', 'Popcorn Time')
+  addAzStyle('PD', 'Pando')
+  addAzStyle('PE', 'PeerProject')
+  addAzStyle('pX', 'pHoeniX')
+  addAzStyle('qB', 'qBittorrent', VER_AZ_DELUGE)
+  addAzStyle('QD', 'qqdownload')
+  addAzStyle('RT', 'Retriever')
+  addAzStyle('RZ', 'RezTorrent')
+  addAzStyle('S~', 'Shareaza alpha/beta')
+  addAzStyle('SB', 'SwiftBit')
+  addAzStyle('SD', '\u8FC5\u96F7\u5728\u7EBF (Xunlei)')// Apparently, the English name of the client is "Thunderbolt".
+  addAzStyle('SG', 'GS Torrent', VER_AZ_FOUR_DIGITS)
+  addAzStyle('SN', 'ShareNET')
+  addAzStyle('SP', 'BitSpirit', VER_AZ_THREE_DIGITS)// >= 3.6
+  addAzStyle('SS', 'SwarmScope')
+  addAzStyle('ST', 'SymTorrent', '2.34')
+  addAzStyle('st', 'SharkTorrent')
+  addAzStyle('SZ', 'Shareaza')
+  addAzStyle('TG', 'Torrent GO')
+  addAzStyle('TN', 'Torrent.NET')
+  addAzStyle('TR', 'Transmission', VER_AZ_TRANSMISSION_STYLE)
+  addAzStyle('TS', 'TorrentStorm')
+  addAzStyle('TT', 'TuoTu', VER_AZ_THREE_DIGITS)
+  addAzStyle('UL', 'uLeecher!')
+  addAzStyle('UE', '\u00B5Torrent Embedded', VER_AZ_THREE_DIGITS_PLUS_MNEMONIC)
+  addAzStyle('UT', '\u00B5Torrent', VER_AZ_THREE_DIGITS_PLUS_MNEMONIC)
+  addAzStyle('UM', '\u00B5Torrent Mac', VER_AZ_THREE_DIGITS_PLUS_MNEMONIC)
+  addAzStyle('UW', '\u00B5Torrent Web', VER_AZ_THREE_DIGITS_PLUS_MNEMONIC)
+  addAzStyle('WD', 'WebTorrent Desktop', VER_AZ_WEBTORRENT_STYLE)// Go Webtorrent!! :)
+  addAzStyle('WT', 'Bitlet')
+  addAzStyle('WW', 'WebTorrent', VER_AZ_WEBTORRENT_STYLE)// Go Webtorrent!! :)
+  addAzStyle('WY', 'FireTorrent')// formerly Wyzo.
+  addAzStyle('VG', '\u54c7\u560E (Vagaa)', VER_AZ_FOUR_DIGITS)
+  addAzStyle('XL', '\u8FC5\u96F7\u5728\u7EBF (Xunlei)')// Apparently, the English name of the client is "Thunderbolt".
+  addAzStyle('XT', 'XanTorrent')
+  addAzStyle('XF', 'Xfplay', '\u5f71\u97f3\u5148\u950b')//xfplay.com
+  addAzStyle('XX', 'XTorrent', '1.2.34')
+  addAzStyle('XC', 'XTorrent', '1.2.34')
+  addAzStyle('ZT', 'ZipTorrent')
+  addAzStyle('7T', 'aTorrent')
+  addAzStyle('ZO', 'Zona', VER_AZ_FOUR_DIGITS)
+  addAzStyle('#@', 'Invalid PeerID')
+
+  addShadowStyle('A', 'ABC')
+  addShadowStyle('O', 'Osprey Permaseed')
+  addShadowStyle('Q', 'BTQueue')
+  addShadowStyle('R', 'Tribler')
+  addShadowStyle('S', 'Shad0w')
+  addShadowStyle('T', 'BitTornado')
+  addShadowStyle('U', 'UPnP NAT')
+
+  addMainlineStyle('M', 'Mainline')
+  addMainlineStyle('Q', 'Queen Bee')
+
+  // Simple clients with no version number.
+  addSimpleClient('\u00B5Torrent', '1.7.0 RC', '-UT170-')// http://forum.utorrent.com/viewtopic.php?pid=260927#p260927
+  addSimpleClient('Azureus', '1', 'Azureus')
+  addSimpleClient('Azureus', '2.0.3.2', 'Azureus', 5)
+  addSimpleClient('Aria', '2', '-aria2-')
+  addSimpleClient('BitTorrent Plus!', 'II', 'PRC.P---')
+  addSimpleClient('BitTorrent Plus!', 'P87.P---')
+  addSimpleClient('BitTorrent Plus!', 'S587Plus')
+  addSimpleClient('BitTyrant (Azureus Mod)', 'AZ2500BT')
+  addSimpleClient('Blizzard Downloader', 'BLZ')
+  addSimpleClient('BTGetit', 'BG', 10)
+  addSimpleClient('BTugaXP', 'btuga')
+  addSimpleClient('BTugaXP', 'BTuga', 5)
+  addSimpleClient('BTugaXP', 'oernu')
+  addSimpleClient('Deadman Walking', 'BTDWV-')
+  addSimpleClient('Deadman', 'Deadman Walking-')
+  addSimpleClient('External Webseed', 'Ext')
+  addSimpleClient('G3 Torrent', '-G3')
+  addSimpleClient('GreedBT', '2.7.1', '271-')
+  addSimpleClient('Hurricane Electric', 'arclight')
+  addSimpleClient('HTTP Seed', '-WS')
+  addSimpleClient('JVtorrent', '10-------')
+  addSimpleClient('Limewire', 'LIME')
+  addSimpleClient('Martini Man', 'martini')
+  addSimpleClient('Pando', 'Pando')
+  addSimpleClient('PeerApp', 'PEERAPP')
+  addSimpleClient('SimpleBT', 'btfans', 4)
+  addSimpleClient('Swarmy', 'a00---0')
+  addSimpleClient('Swarmy', 'a02---0')
+  addSimpleClient('Teeweety', 'T00---0')
+  addSimpleClient('TorrentTopia', '346-')
+  addSimpleClient('XanTorrent', 'DansClient')
+  addSimpleClient('MediaGet', '-MG1')
+  addSimpleClient('MediaGet', '2.1', '-MG21')
+
+  /**
+   * This is interesting - it uses Mainline style, except uses two characters instead of one.
+   * And then - the particular numbering style it uses would actually break the way we decode
+   * version numbers (our code is too hardcoded to "-x-y-z--" style version numbers).
+   *
+   * This should really be declared as a Mainline style peer ID, but I would have to
+   * make my code more generic. Not a bad thing - just something I'm not doing right
+   * now.
+   */
+  addSimpleClient('Amazon AWS S3', 'S3-')
+
+  // Simple clients with custom version schemes
+  // TODO: support custom version schemes
+  addSimpleClient('BitTorrent DNA', 'DNA')
+  addSimpleClient('Opera', 'OP')// Pre build 10000 versions
+  addSimpleClient('Opera', 'O')// Post build 10000 versions
+  addSimpleClient('Burst!', 'Mbrst')
+  addSimpleClient('TurboBT', 'turbobt')
+  addSimpleClient('BT Protocol Daemon', 'btpd')
+  addSimpleClient('Plus!', 'Plus')
+  addSimpleClient('XBT', 'XBT')
+  addSimpleClient('BitsOnWheels', '-BOW')
+  addSimpleClient('eXeem', 'eX')
+  addSimpleClient('MLdonkey', '-ML')
+  addSimpleClient('Bitlet', 'BitLet')
+  addSimpleClient('AllPeers', 'AP')
+  addSimpleClient('BTuga Revolution', 'BTM')
+  addSimpleClient('Rufus', 'RS', 2)
+  addSimpleClient('BitMagnet', 'BM', 2)// BitMagnet - predecessor to Rufus
+  addSimpleClient('QVOD', 'QVOD')
+  // Top-BT is based on BitTornado, but doesn't quite stick to Shadow's naming conventions,
+  // so we'll use substring matching instead.
+  addSimpleClient('Top-BT', 'TB')
+  addSimpleClient('Tixati', 'TIX')
+  // seems to have a sub-version encoded in following 3 bytes, not worked out how: "folx/1.0.456.591" : 2D 464C 3130 FF862D 486263574A43585F66314D5A
+  addSimpleClient('folx', '-FL')
+  addSimpleClient('\u00B5Torrent Mac', '-UM')
+  addSimpleClient('\u00B5Torrent', '-UT') // UT 3.4+
+})()
 
 // ============================================================================
 // 默认配置 / 运行时状态
@@ -111,8 +771,9 @@ function decodePercentEncodedString(s) {
     for (let i = 0; i < s.length; i++) {
         const ch = s.charAt(i)
         if (ch === '%' && i < s.length - 2) {
-            const parsed = parseInt(s.substring(i + 1, i + 3), 16)
-            if (!Number.isNaN(parsed)) {
+            const code = s.substring(i + 1, i + 3)
+            if (/^[0-9A-Fa-f]{2}$/.test(code)) {
+                const parsed = parseInt(code, 16)
                 ret += String.fromCharCode(parsed)
                 i += 2
             } else {
@@ -130,6 +791,19 @@ function decodeClient(str) {
         const code = parseInt(m.slice(1), 16)
         return (code >= 32 && code <= 126) ? String.fromCharCode(code) : m
     })
+}
+
+function unknownPeerClient() {
+    return { client: 'unknown', origin: '', version: '' }
+}
+
+function detectPeerClient(peerId) {
+    try {
+        return getPeerName(peerId) || unknownPeerClient()
+    } catch (e) {
+        honsole.dev('peerId 识别失败，按 unknown 处理:', sanitizeError(e))
+        return unknownPeerClient()
+    }
 }
 
 function countOnes(hexString) {
@@ -745,7 +1419,7 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
     if (isBlocked(peer.ip)) return
 
     const decoded = decodePercentEncodedString(peer.peerId)
-    const c = getPeerName(decoded) || { client: 'unknown', origin: '', version: '' }
+    const c = detectPeerClient(decoded)
     const bitprogress = countOnes(peer.bitfield)
     let toBlock = false
 
@@ -837,9 +1511,12 @@ async function cron() {
                 partialFailure = true
                 continue
             }
-            const status = statusRes[0] || {}
-            const peers  = peersRes[0]  || []
-            if (!Array.isArray(peers)) continue
+            const status = statusRes[0]
+            const peers  = peersRes[0]
+            if (!status || typeof status !== 'object' || Array.isArray(status) || !Array.isArray(peers)) {
+                partialFailure = true
+                continue
+            }
             for (const peer of peers) {
                 if (!peer || !peer.ip) continue
                 processOnePeer(peer, gid, status, activeKeys, banQueue)
@@ -1132,8 +1809,16 @@ async function initial() {
 
     config.ipv6 = detectIpv6Enabled()
 
-    const cfgPath = argv.config || findAria2Config()
-    if (cfgPath) loadConfigFromAria2File(cfgPath)
+    const explicitConfigPath = argv.config !== undefined
+    const cfgPath = explicitConfigPath ? String(argv.config) : findAria2Config()
+    if (cfgPath) {
+        const loaded = loadConfigFromAria2File(cfgPath)
+        if (!loaded && explicitConfigPath) {
+            return runIdleMode(`显式指定的配置文件不可用：${cfgPath}`)
+        }
+    } else if (explicitConfigPath) {
+        return runIdleMode('显式指定的配置文件路径为空')
+    }
 
     applyCliConfig()
 
@@ -1241,6 +1926,7 @@ module.exports = {
         defaultConfig,
         // helpers
         decodePercentEncodedString, decodeClient, countOnes,
+        getPeerName, detectPeerClient,
         formatLocalTimestamp,
         parseList, parsePositiveInteger, parseBoolean,
         hasUnknownKeyword, keywordMatches,

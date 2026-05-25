@@ -32,3 +32,13 @@ test('app.js --help / --version 别名同样可用', () => {
     assert.equal(run(['--help']).status, 0)
     assert.equal(run(['--version']).status, 0)
 })
+
+test('app.js --flush -c 指向不存在文件: 退出码非 0 且不继续默认启动', () => {
+    const missing = path.join(__dirname, '__definitely_missing_aria2.conf')
+    const r = run(['--flush', '-c', missing])
+    assert.equal(r.status, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`)
+    assert.match(r.stderr, /显式指定的配置文件不可用/)
+    assert.match(r.stderr, /--flush 失败/)
+    assert.doesNotMatch(r.stderr, /ipset 不可用/,
+        '显式配置文件读取失败应在触碰 ipset 前停止，避免容器里误操作或误导用户')
+})

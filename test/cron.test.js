@@ -283,6 +283,18 @@ test('cron: system.multicall 子调用 fault 时不清 peerState', async (t) => 
                     { faultCode: 1, faultString: 'gid disappeared' }
                 ] }
             }
+            if (mode === 'malformed-peers') {
+                return { result: [
+                    [{ numPieces: 10, pieceLength: 1024 }],
+                    [{ not: 'an array' }]
+                ] }
+            }
+            if (mode === 'malformed-status') {
+                return { result: [
+                    [null],
+                    [[]]
+                ] }
+            }
             const calls = req.params[0]
             const results = calls.map(c => {
                 if (c.methodName === 'aria2.tellStatus') return [{ numPieces: 10, pieceLength: 1024 }]
@@ -315,6 +327,16 @@ test('cron: system.multicall 子调用 fault 时不清 peerState', async (t) => 
     mode = 'child-fault'
     await cron()
     assert.equal(peerState.size, 1, 'multicall 子调用 fault 属于部分失败，不能清掉累计状态')
+    assert.equal([...peerState.values()][0].wait, 1)
+
+    mode = 'malformed-peers'
+    await cron()
+    assert.equal(peerState.size, 1, 'getPeers 结果形态异常属于部分失败，不能清掉累计状态')
+    assert.equal([...peerState.values()][0].wait, 1)
+
+    mode = 'malformed-status'
+    await cron()
+    assert.equal(peerState.size, 1, 'tellStatus 结果形态异常属于部分失败，不能清掉累计状态')
     assert.equal([...peerState.values()][0].wait, 1)
 
     mode = 'ok'

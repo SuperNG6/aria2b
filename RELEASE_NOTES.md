@@ -1,3 +1,16 @@
+# v2.2.4
+
+## 修复
+
+- 内置 peerId 识别逻辑，生产运行不再依赖 `@huggycn/bittorrent-peerid`，降低供应链暴露面。
+- 显式指定 `-c/--config` 但配置文件不可用时，不再继续用默认 RPC 配置启动；长期运行模式下暂停 aria2b 并保活，`--flush` 一次性命令返回非 0，避免 s6/Docker 中 aria2b 故障拖累同容器 aria2c。
+- `system.multicall` 子结果形态异常（例如 `getPeers` 不是数组、`tellStatus` 缺结果）时视为部分失败，不清理 `peerState`，避免无进度累计被误清。
+- percent-encoded peerId 只有 `%xx` 完整十六进制时才解码，畸形转义原样保留，避免产生不可见控制字符。
+
+## 测试
+
+- 111/111 通过。
+
 # v2.2.3
 
 ## 体验优化

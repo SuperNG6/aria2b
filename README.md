@@ -4,13 +4,15 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来
 
+> **v2.2.4**：内置 peerId 识别逻辑，生产运行不再依赖任何 npm 包；显式指定的配置文件不可用时会暂停 aria2b 并保持进程运行，避免在 s6/Docker 中反复重启影响同容器 aria2c。
+>
 > **v2.2.3**：日志时间前缀改为固定本地格式 `YYYY/MM/DD HH:mm:ss`，例如 `2026/05/25 00:12:50`，避免不同系统 locale 输出不一致。
 >
 > **v2.2.2**：修正 Alpine 3.23 legacy iptables 安装提示：`iptables-legacy` 包已经提供 `ip6tables-legacy`，不要安装不存在的 `ip6tables-legacy` 包；优化运行日志，去掉 `Blocked` / `started!` / "累犯" / "idle mode" 等不直观话术。
 >
 > **v2.2.1**：启动同步 ipset 状态时给 `ipset save` 配置更大的 stdout buffer，避免长期运行黑名单较大时触发 Node 默认 1MB `maxBuffer`；`system.multicall` 子调用 fault / 结果缺失会被视为部分失败，不清理 `peerState`，避免 noprogress 累计被误清。防火墙行为面不变，仍只维护 `bt_blacklist` / `bt_blacklist6` 及对应 INPUT 规则。
 >
-> **v2.1.0**：修复 v2.0.0 的 `scanTimer.unref()` 导致进程在 Docker/s6 下被反复拉起的关键 bug；修复 `block_keywords=Unknown` 不生效、`isLocalHttpsRpcUrl` 子域绕过、CLI 数字 secret 丢前导 0 等问题；**完全移除 axios**，改用 Node 原生 `http/https.request`，bundle 从 520KB → 50KB（10× 缩减），运行依赖仅剩 1 个；新增 ESLint、IPv6 / RPC / parseArgv 全面回归测试（38 → 86）。
+> **v2.1.0**：修复 v2.0.0 的 `scanTimer.unref()` 导致进程在 Docker/s6 下被反复拉起的关键 bug；修复 `block_keywords=Unknown` 不生效、`isLocalHttpsRpcUrl` 子域绕过、CLI 数字 secret 丢前导 0 等问题；**完全移除 axios**，改用 Node 原生 `http/https.request`，bundle 从 520KB → 50KB（10× 缩减）；新增 ESLint、IPv6 / RPC / parseArgv 全面回归测试（38 → 86）。
 >
 > **v2.0.0**：稳定性大修。RPC 改 keep-alive 长连接 + system.multicall 批量；增加指数退避、SIGTERM 优雅退出、本地缓存 LRU、启动同步 ipset 状态、错误日志脱敏 secret；发布物改为单文件 bundle（无需 node_modules，curl 下来 chmod 即可跑），适合 Docker / OpenWrt。要求 Node.js 22+。
 
@@ -37,6 +39,9 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 > **_注：_** 此处使用扫描时的瞬时速度当作扫描间隔里的平均速度，统计对每个peer的上传量（因为没找到aria2c RPC怎么获取现成/精确的每个peer的上传量，transmission倒是有）
 ## 依赖
 `Node.js >= 22` `ipset` `iptables`
+
+生产运行无 npm 依赖；npm 依赖只用于开发、测试和 release 打包。
+
 自行参考[Node.js 官方教程](https://github.com/nodesource/distributions/blob/master/README.md)
 
 Docker 内运行时需要容器具备 `NET_ADMIN` 能力来操作 `ipset` / `iptables`，不建议使用 `--privileged`。
@@ -183,8 +188,9 @@ pm2 startup
 | 百度网盘 | BN（可能） |
 | 未知 | Unknown （请注意大写） |
 
-以上吸血 peer 参考了来自隔壁的 [qBittorrent-Enhanced-Edition](https://github.com/c0re100/qBittorrent-Enhanced-Edition/blob/ebe908f186be5fa2aba8710a543b3ac5c92b92fa/src/base/bittorrent/session.cpp#L2226) 项目的源码，在这里表示感谢  
-如果还想屏蔽更多的 bt 客户端，可以参考 参考[这边的源码](https://github.com/makeding/bittorrent-peerid/blob/master/index.js#L249)  （没有什么必要啦 就迅雷之类的会吸血）  
+以上吸血 peer 参考了来自隔壁的 [qBittorrent-Enhanced-Edition](https://github.com/c0re100/qBittorrent-Enhanced-Edition/blob/ebe908f186be5fa2aba8710a543b3ac5c92b92fa/src/base/bittorrent/session.cpp#L2226) 项目的源码，在这里表示感谢
+
+如果还想屏蔽更多的 bt 客户端，可以参考本项目 `app.js` 中内置的 BitTorrent peerId 识别表（没有什么必要啦，就迅雷之类的会吸血）
 ban 未知的 peer 按照需求添加
 
 # Enjoy～ 

@@ -1,6 +1,6 @@
 {
     "name": "aria2b",
-    "version": "2.2.3",
+    "version": "2.2.4",
     "license": "MIT",
     "engines": {
         "node": ">=22 <25"
@@ -15,9 +15,6 @@
         "test": "node --test 'test/*.test.js'",
         "check": "node --check app.js",
         "lint": "eslint app.js test/ eslint.config.js"
-    },
-    "dependencies": {
-        "@huggycn/bittorrent-peerid": "1.3.4"
     },
     "author": "huggy",
     "repository": "https://github.com/makeding/aria2b",

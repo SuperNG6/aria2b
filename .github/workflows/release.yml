@@ -70,7 +70,7 @@ jobs:
           # 这里直接调本地版本，避免每次 release 都从 npm registry 拉一遍。
           npx esbuild app.js \
             --bundle --platform=node --target=node22 \
-            --format=cjs --legal-comments=none \
+            --format=cjs --legal-comments=inline \
             --outfile=dist/aria2b
           chmod +x dist/aria2b
 

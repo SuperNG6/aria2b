@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 aria2b 是为 aria2 自动封禁吸血 BT 客户端（迅雷 / 影音先锋 / 未知客户端等）的守护脚本。**主要部署目标是 docker-aria2（Alpine + s6-overlay + aria2c）容器环境**，需要在无人值守的情况下长期稳定运行。
 
-设计哲学：极简、自包含、零运维。运行时只剩 1 个 npm 依赖（`@huggycn/bittorrent-peerid`），构建产物是单文件 bundle（~50KB），不需要 `node_modules` 即可在 OpenWrt / Docker 上 chmod 后直接跑。
+设计哲学：极简、自包含、零运维。生产运行没有 npm 依赖（peerId 识别逻辑已内置），构建产物是单文件 bundle，不需要 `node_modules` 即可在 OpenWrt / Docker 上 chmod 后直接跑。
 
 ## 常用命令
 
@@ -24,7 +24,7 @@ npm run check                # node --check app.js（语法检查）
 
 ## 架构总览
 
-整个项目是**一个单文件**：[app.js](app.js)（~1000 行）。所有逻辑都在这里。测试通过 `module.exports._internal` 暴露内部函数访问。新增任何模块拆分前请先与用户确认 —— 单文件是有意为之的设计约束，bundle 大小 / 自包含分发依赖这一点。
+整个项目是**一个单文件**：[app.js](app.js)。所有逻辑都在这里。测试通过 `module.exports._internal` 暴露内部函数访问。新增任何模块拆分前请先与用户确认 —— 单文件是有意为之的设计约束，bundle 大小 / 自包含分发依赖这一点。
 
 数据流：
 
