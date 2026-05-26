@@ -54,6 +54,22 @@ jobs:
             echo "Tag $tag does not match package.json version $pkg"
             exit 1
           fi
+      - name: Prepare release notes
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          mkdir -p dist
+
+          if [ -s RELEASE_NOTES.md ]; then
+            awk -v tag="$tag" '
+              $0 == "# " tag { found = 1; print; next }
+              found && /^# v[0-9]+\.[0-9]+\.[0-9]+/ { exit }
+              found { print }
+              END { if (!found) exit 1 }
+            ' RELEASE_NOTES.md > dist/release-notes.md || {
+              echo "RELEASE_NOTES.md does not contain a # ${tag} section"
+              exit 1
+            }
+          fi
       - name: Build single-file bundle
         run: |
           mkdir -p dist
@@ -90,15 +106,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.tag.outputs.tag }}"
-          # 优先用仓库里的 RELEASE_NOTES.md 作为 release body；缺失时退回自动生成。
+          # 优先用仓库里的 RELEASE_NOTES.md 当前 tag 段落作为 release body；缺失时退回自动生成。
           # 这样每次发版的更新说明在 commit 里就是 reviewable 的，不依赖 GH 自动归并。
-          if [ -s RELEASE_NOTES.md ]; then
+          if [ -s dist/release-notes.md ]; then
             gh release create "$tag" \
               dist/aria2b \
               aria2b-*.tgz \
               dist/*.sha256 \
               --title "$tag" \
-              --notes-file RELEASE_NOTES.md
+              --notes-file dist/release-notes.md
           else
             gh release create "$tag" \
               dist/aria2b \
