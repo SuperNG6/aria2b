@@ -818,6 +818,15 @@ function countOnes(hexString) {
     return count
 }
 
+function hasProgressBit(hexString) {
+    if (!hexString || typeof hexString !== 'string') return false
+    for (let i = 0; i < hexString.length; i++) {
+        const n = parseInt(hexString[i], 16)
+        if (!Number.isNaN(n) && n !== 0) return true
+    }
+    return false
+}
+
 function parseList(value) {
     return String(value || '')
         .split(',')
@@ -1420,7 +1429,6 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
 
     const decoded = decodePercentEncodedString(peer.peerId)
     const c = detectPeerClient(decoded)
-    const bitprogress = countOnes(peer.bitfield)
     let toBlock = false
 
     if (keywordMatches(config.block_keywords, c.origin) ||
@@ -1439,7 +1447,7 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
 
         // pieceLength 不可知就跳过 noprogress 判定。
         // 旧版兜底为 1，等于把字节当 piece 算，几个字节就触发误封。
-        if (isNoProgTarget && uploadSpeed > PEER_MIN_UPLOAD_BYTES_PER_SEC && bitprogress === 0 && pieceLength > 0) {
+        if (isNoProgTarget && uploadSpeed > PEER_MIN_UPLOAD_BYTES_PER_SEC && pieceLength > 0 && !hasProgressBit(peer.bitfield)) {
             const s = getPeerState(stateKey)
             s.uploaded += uploadSpeed * config.scan_interval / 1000
             const uploadPiece = s.uploaded / pieceLength
@@ -1449,7 +1457,7 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
                     if (s.wait > config.noprogress_wait) {
                         const human = decodeClient(peer.peerId).substring(0, 16) || 'unknown'
                         const np = Number(status.numPieces) || 0
-                        honsole.log(`封禁疑似无进度上传 BT peer：${peer.ip}（${human}）；已上传约 ${uploadPiece.toFixed(2)} 个分片，对方进度仍为 ${bitprogress}/${np}，连续异常 ${s.wait} 次（阈值 ${config.noprogress_wait}）`)
+                        honsole.log(`封禁疑似无进度上传 BT peer：${peer.ip}（${human}）；已上传约 ${uploadPiece.toFixed(2)} 个分片，对方进度仍为 0/${np}，连续异常 ${s.wait} 次（阈值 ${config.noprogress_wait}）`)
                         toBlock = true
                     }
                 } else {
@@ -1926,6 +1934,7 @@ module.exports = {
         defaultConfig,
         // helpers
         decodePercentEncodedString, decodeClient, countOnes,
+        hasProgressBit,
         getPeerName, detectPeerClient,
         formatLocalTimestamp,
         parseList, parsePositiveInteger, parseBoolean,

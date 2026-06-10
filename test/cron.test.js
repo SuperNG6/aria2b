@@ -384,6 +384,45 @@ test('cron: 上传中且 bitfield 有进度 → 不 ban', async (t) => {
     assert.equal(adds.length, 0, '对方有进度，绝不能 ban')
 })
 
+test('cron: 非 noprogress 目标不因 bitfield 扫描产生状态或 ban', async (t) => {
+    _reset()
+    config.noprogress_keywords = ['XL']
+    config.block_keywords = ['NEVER_MATCH']
+
+    const mock = await startMockAria2((req) => {
+        if (req.method === 'aria2.tellActive') return { result: [{ gid: 'g' }] }
+        if (req.method === 'system.multicall') {
+            const calls = req.params[0]
+            const results = calls.map(c => {
+                if (c.methodName === 'aria2.tellStatus') return [{ numPieces: 100, pieceLength: 1024 }]
+                if (c.methodName === 'aria2.getPeers') return [[
+                    {
+                        peerId: '%2DUT3550%2Dabcdef012345',
+                        ip: '203.0.113.77',
+                        uploadSpeed: 999999,
+                        downloadSpeed: 0,
+                        bitfield: 'f'.repeat(8192)
+                    }
+                ]]
+                return [null]
+            })
+            return { result: results }
+        }
+        return { result: [] }
+    })
+    t.after(() => mock.close())
+
+    config.rpc_url = mock.url
+    _setRpcClient(_makeRpcClient())
+    const spy = spyExecFile()
+    t.after(() => spy.restore())
+
+    await cron()
+    const adds = spy.calls.filter(c => c.file === 'ipset' && c.args[0] === 'add')
+    assert.equal(adds.length, 0, '非 noprogress 目标不应 ban')
+    assert.equal(peerState.size, 0, '非 noprogress 目标不应创建状态机条目')
+})
+
 // ---------- cron: pieceLength 不可知 → 不 ban ----------
 
 test('cron: pieceLength=0 → 跳过 noprogress 判定（避免兜底为 1 的灾难）', async (t) => {

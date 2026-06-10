@@ -1,3 +1,14 @@
+# v2.2.5
+
+## 性能优化
+
+- 延迟无进度上传检测中的 bitfield 扫描：普通 peer、非监控客户端、上传速度不达标或 `pieceLength` 不可知时不再扫描整段 bitfield。
+- 新增 `hasProgressBit()` 快速判断是否存在任意进度位；对已有进度的 peer 可早停，不再完整 popcount。
+
+## 测试
+
+- 113/113 通过。新增 `hasProgressBit` 单元测试，以及非 noprogress 目标携带长 bitfield 时不创建状态机、不封禁的回归测试。
+
 # v2.2.4
 
 ## 修复

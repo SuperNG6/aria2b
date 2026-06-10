@@ -5,7 +5,7 @@ const assert = require('node:assert/strict')
 const { _internal } = require('../app.js')
 
 const {
-    decodePercentEncodedString, decodeClient, countOnes,
+    decodePercentEncodedString, decodeClient, countOnes, hasProgressBit,
     getPeerName, detectPeerClient,
     formatLocalTimestamp,
     parseList, parsePositiveInteger, parseBoolean,
@@ -102,6 +102,18 @@ test('countOnes: 数 bitfield 的 1 个数（per-nibble popcount）', () => {
     // 巨长 hex（旧版 BigInt 在某些场景下会出问题）
     const longHex = 'ff'.repeat(1000)
     assert.equal(countOnes(longHex), 8000)
+})
+
+test('hasProgressBit: 快速判断 bitfield 是否存在任意进度', () => {
+    assert.equal(hasProgressBit(''), false)
+    assert.equal(hasProgressBit(null), false)
+    assert.equal(hasProgressBit('0000'), false)
+    assert.equal(hasProgressBit('0001'), true)
+    assert.equal(hasProgressBit('8000'), true)
+    assert.equal(hasProgressBit('000F'), true)
+    // 与 countOnes 一致：非法 hex nibble 忽略，不把它当进度。
+    assert.equal(hasProgressBit('ZZZ'), false)
+    assert.equal(hasProgressBit('00Z10'), true)
 })
 
 // ---------- getPeerName ----------

@@ -1,12 +1,12 @@
 {
     "name": "aria2b",
-    "version": "2.2.4",
+    "version": "2.2.5",
     "lockfileVersion": 3,
     "requires": true,
     "packages": {
         "": {
             "name": "aria2b",
-            "version": "2.2.4",
+            "version": "2.2.5",
             "license": "MIT",
             "bin": {
                 "aria2b": "app.js"
