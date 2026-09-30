@@ -18,14 +18,15 @@ const { config, sanitizeError, _reset, _makeRpcClient, httpJsonPost } = _interna
 
 test.beforeEach(() => _reset())
 
-function startServer(handler) {
-    return new Promise(resolve => {
+function startServer(handler, hostname = '127.0.0.1') {
+    return new Promise((resolve, reject) => {
         const server = http.createServer(handler)
-        server.listen(0, '127.0.0.1', () => {
+        server.once('error', reject)
+        server.listen(0, hostname, () => {
             const { port } = server.address()
             resolve({
                 server,
-                url: `http://127.0.0.1:${port}/jsonrpc`,
+                url: `http://${hostname.includes(':') ? `[${hostname}]` : hostname}:${port}/jsonrpc`,
                 close: () => new Promise(r => server.close(r))
             })
         })
@@ -66,6 +67,35 @@ test('makeRpcClient: 正常 JSON POST → 解析 data', async (t) => {
     assert.equal(receivedBody.method, 'ping')
     assert.deepEqual(r.data, { ok: true, echo: 'x1' })
     assert.equal(r.status, 200)
+})
+
+test('makeRpcClient: IPv6 字面量地址支持 JSON POST 并保留路径和查询参数', async (t) => {
+    let mock
+    try {
+        mock = await startServer((req, res) => {
+            const chunks = []
+            req.on('data', c => chunks.push(c))
+            req.on('end', () => {
+                res.end(JSON.stringify({
+                    method: req.method,
+                    path: req.url,
+                    body: JSON.parse(Buffer.concat(chunks).toString('utf8'))
+                }))
+            })
+        }, '::1')
+    } catch (e) {
+        if (!['EAFNOSUPPORT', 'EADDRNOTAVAIL'].includes(e.code)) throw e
+        t.skip('环境不支持 IPv6 回环地址')
+        return
+    }
+    t.after(() => mock.close())
+    const client = _makeRpcClient()
+    t.after(() => client.destroy())
+
+    const body = { jsonrpc: '2.0', id: 'ipv6', method: 'aria2.getVersion' }
+    const r = await client.post(`${mock.url}?source=ipv6`, body)
+    assert.equal(r.status, 200)
+    assert.deepEqual(r.data, { method: 'POST', path: '/jsonrpc?source=ipv6', body })
 })
 
 test('makeRpcClient: keep-alive 复用 socket（基础健壮性）', async (t) => {
@@ -476,4 +506,24 @@ test('makeRpcClient: TLS rejectUnauthorized=false 时能连自签 https 服务�
     const r = await lax.post(url, {})
     assert.equal(r.status, 200)
     assert.deepEqual(r.data, { tls: true })
+
+    await t.test('IPv6 HTTPS 字面量地址复用 TLS Agent 配置', async (t) => {
+        const ipv6 = httpsLib.createServer({ cert, key }, (req, res) => {
+            res.end(JSON.stringify({ tls: true, ipv6: true }))
+        })
+        try {
+            await new Promise((resolve, reject) => {
+                ipv6.once('error', reject)
+                ipv6.listen(0, '::1', resolve)
+            })
+        } catch (e) {
+            if (!['EAFNOSUPPORT', 'EADDRNOTAVAIL'].includes(e.code)) throw e
+            t.skip('环境不支持 IPv6 回环地址')
+            return
+        }
+        t.after(() => new Promise(resolve => ipv6.close(resolve)))
+        const result = await lax.post(`https://[::1]:${ipv6.address().port}/jsonrpc`, {})
+        assert.equal(result.status, 200)
+        assert.deepEqual(result.data, { tls: true, ipv6: true })
+    })
 })

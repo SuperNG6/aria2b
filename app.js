@@ -819,12 +819,8 @@ function countOnes(hexString) {
 }
 
 function hasProgressBit(hexString) {
-    if (!hexString || typeof hexString !== 'string') return false
-    for (let i = 0; i < hexString.length; i++) {
-        const n = parseInt(hexString[i], 16)
-        if (!Number.isNaN(n) && n !== 0) return true
-    }
-    return false
+    // 只检查非零十六进制字符，避免对无进度 bitfield 逐字符执行 parseInt。
+    return typeof hexString === 'string' && /[1-9a-f]/i.test(hexString)
 }
 
 function parseList(value) {
@@ -1027,7 +1023,8 @@ function httpJsonPost(opts, url, body) {
         const reqOpts = {
             method: 'POST',
             protocol: parsed.protocol,
-            hostname: parsed.hostname,
+            // URL.hostname 保留 IPv6 方括号；request 的 hostname 必须是不带括号的地址。
+            hostname: parsed.hostname.replace(/^\[|\]$/g, ''),
             port: parsed.port || (isHttps ? 443 : 80),
             path: (parsed.pathname || '/') + (parsed.search || ''),
             agent,
@@ -1534,6 +1531,8 @@ async function cron() {
         // 4) 顺序 ban，避免对 ipset 子进程的并发竞争
         for (const { ip, info } of banQueue) {
             if (shuttingDown) break
+            // 同 IP 可能出现在多个任务；仅跳过成功封禁，失败时仍允许后续重试。
+            if (isBlocked(ip)) continue
             await blockIp(ip, info)
         }
 

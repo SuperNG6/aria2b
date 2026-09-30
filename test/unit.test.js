@@ -116,6 +116,26 @@ test('hasProgressBit: 快速判断 bitfield 是否存在任意进度', () => {
     assert.equal(hasProgressBit('00Z10'), true)
 })
 
+test('hasProgressBit: 优化后保留大小写、非法字符和输入类型语义', () => {
+    const previous = value => {
+        if (!value || typeof value !== 'string') return false
+        for (let i = 0; i < value.length; i++) {
+            const n = parseInt(value[i], 16)
+            if (!Number.isNaN(n) && n !== 0) return true
+        }
+        return false
+    }
+    for (const value of [undefined, null, 0, false, {}, [], Buffer.from('ff'), '',
+        '0'.repeat(8192), '0'.repeat(8192) + 'A', 'gxyz', '%00', 'not-hex']) {
+        assert.equal(hasProgressBit(value), previous(value))
+    }
+    // 穷举单字符，覆盖十六进制大小写及所有非十六进制 UTF-16 字符。
+    for (let code = 0; code <= 0xffff; code++) {
+        const value = String.fromCharCode(code)
+        assert.equal(hasProgressBit(value), previous(value), `字符编码 ${code}`)
+    }
+})
+
 // ---------- getPeerName ----------
 test('getPeerName: 内置 peerId 识别保留 @huggycn/bittorrent-peerid 行为', () => {
     assert.deepEqual(getPeerName('-XL0012-123456789012'), {

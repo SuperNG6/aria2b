@@ -4,6 +4,8 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来
 
+> **v2.2.6**：修复 IPv6 字面量 RPC 地址无法连接；加速无进度 bitfield 检查，并跳过同轮已成功封禁的重复 IP，减少 CPU 开销、子进程和重复日志。
+>
 > **v2.2.5**：优化无进度上传检测的 bitfield 扫描路径，非监控客户端、上传速度不达标或已有进度的 peer 不再做完整 popcount，降低长期运行时的周期性 CPU 开销。
 >
 > **v2.2.4**：内置 peerId 识别逻辑，生产运行不再依赖任何 npm 包；显式指定的配置文件不可用时会暂停 aria2b 并保持进程运行，避免在 s6/Docker 中反复重启影响同容器 aria2c。

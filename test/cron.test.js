@@ -107,6 +107,56 @@ test('cron: 关键字命中（XL）→ ipset add 调用', async (t) => {
     assert.equal(isBlocked('203.0.113.5'), true, 'IP 应进入本地缓存')
 })
 
+for (const failFirst of [false, true]) {
+    test(`cron: 同 IP 多任务只在成功后跳过重复封禁（首次失败=${failFirst}）`, async (t) => {
+        _reset()
+        const repeatedIp = '203.0.113.5'
+        const otherIp = '203.0.113.6'
+        const mock = await startMockAria2(req => {
+            if (req.method === 'aria2.tellActive') {
+                return { result: ['one', 'two', 'three', 'other'].map(gid => ({ gid })) }
+            }
+            if (req.method === 'system.multicall') {
+                return { result: req.params[0].map(call => {
+                    if (call.methodName === 'aria2.tellStatus') return [{ numPieces: 100, pieceLength: 16384 }]
+                    return [[{ peerId: '%2DXL0012%2Dabcdef012345',
+                        ip: call.params[1] === 'other' ? otherIp : repeatedIp,
+                        uploadSpeed: 2048, downloadSpeed: 0, bitfield: '00' }]]
+                }) }
+            }
+            return { result: [] }
+        })
+        t.after(() => mock.close())
+        config.rpc_url = mock.url
+        const client = _makeRpcClient()
+        _setRpcClient(client)
+        t.after(() => client.destroy())
+        const adds = []
+        const original = runtime.execFile
+        runtime.execFile = async (file, args) => {
+            assert.equal(file, 'ipset')
+            adds.push([...args])
+            if (failFirst && adds.length === 1) throw new Error('临时 ipset 故障')
+            return { stdout: '', stderr: '' }
+        }
+        t.after(() => { runtime.execFile = original })
+
+        await cron()
+        assert.equal(adds.length, failFirst ? 3 : 2)
+        assert.equal(adds.filter(args => args[3] === repeatedIp).length, failFirst ? 2 : 1)
+        assert.equal(isBlocked(repeatedIp), true)
+        assert.equal(isBlocked(otherIp), true)
+        assert.ok(adds.every(args => args[1] === '-exist'))
+
+        const count = adds.length
+        await cron()
+        assert.equal(adds.length, count, '后续扫描仍应复用成功封禁缓存')
+        blockedIps.set(repeatedIp, Date.now() - 1)
+        await cron()
+        assert.equal(adds.length, count + 1, '到期后应重新封禁一次')
+    })
+}
+
 // ---------- cron: B2 回归 — block_keywords 含 Unknown 必须直接屏蔽未知客户端 ----------
 
 test('cron: block_keywords 含 Unknown 时直接屏蔽未知客户端（B2 回归）', async (t) => {
