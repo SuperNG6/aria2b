@@ -1,104 +1,149 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+本文件给在本仓库工作的编码 agent 提供上下文。代码位置一律用函数名 / 常量名指代，不写行号（行号会随改动失效，用 grep 定位）。
 
 ## 项目定位
 
-aria2b 是为 aria2 自动封禁吸血 BT 客户端（迅雷 / 影音先锋 / 未知客户端等）的守护脚本。**主要部署目标是 docker-aria2（Alpine + s6-overlay + aria2c）容器环境**，需要在无人值守的情况下长期稳定运行。
+aria2b 是 aria2 的守护脚本：周期性通过 aria2 JSON-RPC 检查 BT peer，命中策略（迅雷 / 影音先锋 / 未知客户端等吸血客户端）后用 ipset + iptables 封禁 IP。
 
-设计哲学：极简、自包含、零运维。运行时只剩 1 个 npm 依赖（`@huggycn/bittorrent-peerid`），构建产物是单文件 bundle（~50KB），不需要 `node_modules` 即可在 OpenWrt / Docker 上 chmod 后直接跑。
+**主要部署目标是 docker-aria2（Alpine + s6-overlay v2 + aria2c）**，aria2b 是同容器里的一个 s6 service，需要无人值守长期运行。设计哲学：极简、自包含、零运维。生产运行零 npm 依赖，发布物是 esbuild 打出的单文件 bundle，`chmod +x` 后只需 Node.js 即可运行。
+
+## 仓库与分发
+
+- 本仓库 `SuperNG6/aria2b` 是上游 `makeding/aria2b` 的维护分支，v2.x 只在这里发布。
+- npm 上的 `aria2b` 包归上游维护者所有，停留在 v1.0.9；本仓库**无法**发布 npm，release.yml 也没有 `npm publish`。README 推荐 release 单文件或 release 附带的 tgz，不要改回 `npm i -g aria2b`。
+- 仓库未开启 issues。
 
 ## 常用命令
 
 ```bash
-npm install                  # 装依赖（开发用）
+npm ci                       # 安装开发依赖（esbuild / eslint / globals）
 node app.js                  # 直接运行
 npm test                     # node --test 'test/*.test.js'
-node --test test/rpc.test.js # 跑单个测试文件
-node --test --test-name-pattern='cron:' test/cron.test.js  # 跑单个用例
+node --test test/rpc.test.js # 单个测试文件
+node --test --test-name-pattern='cron:' test/cron.test.js  # 单个用例
 npm run lint                 # eslint app.js test/ eslint.config.js
-npm run check                # node --check app.js（语法检查）
+npm run check                # node --check app.js
 ```
 
-发布走 GitHub Actions（`release.yml`，手动 `gh workflow run release.yml -f tag=vX.Y.Z` 或 push tag）。Release 流水线会在 esbuild 打包前用 `sed` 把 `app.js` 里 `'standalone'` 字面量替换成实际版本号，因此**绝不要把 `let VERSION = 'standalone'` 这行改成别的形式**。
+改动完成前至少跑 check、lint 和全部测试。CI 矩阵是 Node 22 / 24，两个版本都要通过。
 
-## 架构总览
+## 发布流程
 
-整个项目是**一个单文件**：[app.js](app.js)（~1000 行）。所有逻辑都在这里。测试通过 `module.exports._internal` 暴露内部函数访问。新增任何模块拆分前请先与用户确认 —— 单文件是有意为之的设计约束，bundle 大小 / 自包含分发依赖这一点。
+1. 版本号改三处：`package.json` 和 `npm-shrinkwrap.json`（顶层 `version` 与 `packages[""].version`）。
+2. `RELEASE_NOTES.md` 顶部新增 `# vX.Y.Z` 段落。release.yml 用 awk 截取这一段作为 release 正文，**缺段会让发布失败**。
+3. README 顶部版本摘要加一条 `> **vX.Y.Z**：...`。
+4. 推 tag `vX.Y.Z`，或 `gh workflow run release.yml -f tag=vX.Y.Z`。tag 必须与 package.json 版本一致。推 tag / 发 release 属于对外操作，先征得用户确认。
 
-数据流：
+release.yml 在打包前用 `sed` 把 `let VERSION = 'standalone'` 替换成实际版本号，**这一行的写法绝不能改**。打包后会在没有 node_modules 的目录里自检 `-v` / `-h`，并附带 `npm pack` 生成的 tgz 和 sha256。
+
+## 架构
+
+整个项目是**一个单文件** [app.js](app.js)，这是有意的设计约束（自包含分发依赖这一点），拆模块前先与用户确认。测试通过 `module.exports._internal` 访问内部函数。
+
+文件分区（按 `// ====` 注释分隔）：
+
+- **BitTorrent peerId 识别**：`getPeerName` 及其客户端表，派生自 `@huggycn/bittorrent-peerid@1.3.4`（保留 MIT 版权声明）。aria2b 依赖其 fork 增加的 `origin` 字段（如 `XL`、`SD`）做关键词匹配。这段保持上游风格（2 空格缩进），除非修 bug 不要重排。
+- **配置 / 状态**：`defaultConfig()`、全局 `config` / `blockedIps` / `peerState`，以及测试可替换的 `runtime.execFile`。
+- **logger**：`honsole`。`logt` 带 `YYYY/MM/DD HH:mm:ss` 本地时间前缀，`HIDE_TIME_PREFIX=1` 时去掉；`dev` 只在 `DEV=1` 时输出。
+- **RPC**：`httpJsonPost`（Node 原生 http/https，返回 axios 风格的 `{ data, status, statusText }`）、`makeRpcClient`（keep-alive Agent）、`rpcPost`（把 aria2 错误还原成可读信息）、`rpcCall`、`rpcMulticall`。
+- **ipset / iptables**：`pickIptablesBackendForVersion`、`flushIptablesIpset`、`ensureIptablesRule`、`blockIp`、`readIpsetSave`、`syncBlockedIpsFromIpset`、`runIdleMode`。
+- **扫描**：`cron`、`processOnePeer`、`scheduleNext`、`runLoop`、`backoffDelay`。
+- **配置加载 / CLI**：`loadConfigFromAria2File`、`findAria2Config`、`parseArgv`、`applyCliConfig`、`helpText`。
+- **入口**：`installSignalHandlers`、`initial`。
+
+主循环数据流：
 
 ```
-cron() 主循环（scheduleNext → backoffDelay）
+runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退避，上限 60s）
   ├─ aria2.tellActive            拿活跃 gid
   ├─ system.multicall            一次批量拿所有 (tellStatus + getPeers)
   ├─ processOnePeer()            对每个 peer 跑策略
-  │     ├─ keywordMatches        block_keywords 命中 → ban
-  │     └─ noprogress 状态机      累计上传 > N pieces 且 bitfield=0 连续命中 wait 次 → ban
-  └─ blockIp() → ipset add       顺序 ban（不并发，避免子进程竞争）
+  │     ├─ block_keywords 命中 origin（或配置了 Unknown 且客户端未知）→ 封禁
+  │     └─ noprogress 状态机：监控客户端、上传 >1KiB/s、bitfield 全 0，
+  │        累计上传 > noprogress_piece 个分片后，对方下载速度为 0 的扫描次数 > noprogress_wait → 封禁
+  └─ blockIp() → ipset add       顺序执行（不并发，避免子进程竞争）
 ```
 
 状态：
-- `blockedIps: Map<ip, expiresAtMs>` — 本进程封禁缓存，避免重复 `ipset add`；启动时由 `readIpsetSave()` + `syncBlockedIpsFromIpset` 从 `ipset save` 同步
-- `peerState: Map<key, {uploaded, wait}>` — noprogress 连续命中状态机；key 是 `gid\0peerId\0ip`
-- 两个 Map 都有容量上限（`MAX_BLOCKED_IPS=200000` / `MAX_PEER_STATE=50000`），超限时 FIFO 淘汰最老条目
 
-配置合并顺序：`defaultConfig()` → 读 aria2.conf 寄生配置（`ab-*` 开头的键） → CLI 参数覆盖。aria2.conf 路径搜索顺序见 `findAria2Config()`。
+- `blockedIps: Map<ip, expiresAtMs>`：本进程封禁缓存，避免重复 `ipset add`；启动时从 `ipset save` 同步。
+- `peerState: Map<key, {uploaded, wait}>`：noprogress 状态机，key 是 `gid\0peerId\0ip`。
+- 两个 Map 都有容量上限（`MAX_BLOCKED_IPS` / `MAX_PEER_STATE`），超限时淘汰最早插入的条目。
 
-## 关键不变量（修改时必须保留）
+配置合并顺序：`defaultConfig()` → `detectIpv6Enabled()` → aria2.conf 寄生配置（`rpc-secret` / `rpc-listen-port` / `rpc-secure` / `disable-ipv6` 和 `ab-*` 键）→ CLI 参数覆盖。未指定 `-c` 时按 `findAria2Config()` 的顺序搜索配置文件。
 
-这些是从历史事故里学来的不变量，每条都有具体的 bug 历史。改动相关代码时务必保留语义：
+## 关键不变量（修改相关代码时必须保留）
 
-1. **`scanTimer` 绝不能 `.unref()`**（[app.js:676-684](app.js#L676-L684)）。Node 的 `http.Agent` keep-alive socket 自带 unref，如果再把扫描定时器也 unref，cron 跑完事件循环就静默 `exit(0)`，s6/systemd 看起来像"反复重启"，peerState 一并被清零导致吸血 peer 永远封不上。SIGTERM 处理器有显式 `clearTimeout(scanTimer)` + `process.exit(0)`，不需要 unref 来辅助退出。
+每条都来自真实事故，绝大多数有回归测试。改相关代码前先读对应测试。
 
-2. **`isLocalHttpsRpcUrl` 必须用 `net.isIPv4` + `127/8` 判断**（[app.js:206-221](app.js#L206-L221)），不能 `host.startsWith('127.')` —— 否则 `127.0.0.1.evil.com` 这种子域可以让 TLS 校验被默认关闭。
+### 进程存活
 
-3. **`keywordMatches` 显式跳过 `'unknown'` 关键字**（[app.js:165-172](app.js#L165-L172)）。未知客户端的 ban 路径必须由 `hasUnknownKeyword(...) + c.client === 'unknown'` 显式接管（见 [app.js:562-567](app.js#L562-L567) 和 [app.js:602-606](app.js#L602-L606)）。否则 `block_keywords` 里写 `Unknown` 只是装饰。
+1. **`scanTimer` 绝不能 `.unref()`**（`scheduleNext`）。`http.Agent` 的 keep-alive 空闲 socket 本身是 unref 的，再 unref 扫描定时器的话，cron 跑完后进程会静默 `exit(0)`，s6 不断拉起，`peerState` 每次清零，吸血 peer 永远封不上。
+2. **启动阶段环境不可用时进 `runIdleMode()`，绝不 `process.exit`**。进程退出会让 s6-overlay v2 每 1–2 秒重启一次，淹没日志并拖慢同容器的 aria2c。
+   - 入口：显式 `-c` 配置文件不可用、`ipset save` 失败、IPv4 iptables 后端不可用、IPv4 flush/ensure 失败、`initial()` 兜底 catch、`uncaughtException` / `unhandledRejection`。
+   - `runIdleMode` 会清掉 `scanTimer`、销毁 `rpcClient`，并装一个 1 小时间隔的 refed `setInterval`（**不能** unref，理由同第 1 条）；`scheduleNext` 发现 `idleHeartbeat` 存在时不再调度。
+   - 例外：`--flush` 是手动执行的一次性命令，失败时 `exit(1)`。
+   - 面向用户的日志直接说明"启动环境不可用、已暂停扫描、aria2c 不受影响、修复后重启容器"，不写抽象的模式名。
+3. **`installSignalHandlers()` 必须在 `initial()` 的第一个 `await` 之前调用**。否则 docker stop 可能在 `ipset destroy` 之后、`create` 之前杀掉进程。`stop()` 会清 `scanTimer` / `idleHeartbeat`、销毁 `rpcClient`，等当前 cron 结束后 `exit(0)`。
 
-4. **`parsePositiveInteger` 显式拒绝 `boolean`**（[app.js:144-150](app.js#L144-L150)）。CLI 解析 `--key`（不带值）会得到 `true`，`Number(true)=1` 会被静默写入正整数字段。
+### RPC
 
-5. **`parseArgv` 不做类型转换，value 始终是 string 或 `true`**（[app.js:774-808](app.js#L774-L808)）。`--secret 001234` 必须保留前导 0；`--rpc-url 1234` 不应被改型。数字字段在 `applyCliConfig` 里各自显式 `Number()`。
+4. **`httpJsonPost` 的超时是外层 `setTimeout` 绝对超时**，覆盖 connect、headers、body 全过程，只在 `req` 的 `close` / `error` 时清除。不能只用 `req.setTimeout`（connect 阶段不生效），也不能在收到 `response` 时就清（服务器只发 headers 不发 body 时 cron 会永久挂死）。
+5. **HTTP 3xx 必须当错误抛出**。否则空响应会被当成"无活跃任务"。同理，`tellActive` 结果不是数组时也按失败处理，不能当成没有任务。
+6. **错误日志一律经过 `sanitizeError`**。请求体里有 `token:secret`，容器日志常被采集，泄漏 secret 是 P0。
+7. **`isLocalHttpsRpcUrl` 用 `net.isIPv4` + `127.` 前缀判断**，不能直接对 hostname 做 `startsWith('127.')`，否则 `127.0.0.1.evil.com` 会让 TLS 校验被默认关闭。
+8. **IPv6 字面量 RPC 地址要去掉方括号再传给 `request` 的 `hostname`**（`http://[::1]:6800/jsonrpc`）。
+9. **aria2 用 HTTP 400 返回 RPC 错误**（错误在 JSON 响应体的 `error` 里，例如 secret 不对时是 `Unauthorized`）。`httpJsonPost` 把 3xx 及以上响应里的 JSON 附在 `e.response.data`，`rpcPost` 再还原成 aria2 的错误信息；不能退回到只记 `HTTP 400 Bad Request`。
 
-6. **RPC 超时用外层 `setTimeout` 包整个请求**（[app.js:401-411](app.js#L401-L411)），不能只用 `req.setTimeout` —— 那只在 socket 分配后才生效，connect 阶段卡住时会被 TCP 内核默认 ~2 分钟超时拖死。
+### 扫描状态机
 
-7. **`httpJsonPost` 3xx 必须当错误抛**（[app.js:380-384](app.js#L380-L384)），不能静默把 `data` 当 `undefined` —— 否则 cron 会把异常空响应当成"无活跃任务"。
+10. **只有 `fullySucceeded` 时才调用 `cleanupPeerState`**。RPC 失败、multicall 结果长度不符、子调用失败（aria2 返回 `{ code, message }` 而不是 `[result]`）或结果形态异常，都算部分失败：跳过对应 gid，保留累计状态。
+11. **`processOnePeer` 把 peer 放进 `banQueue` 时立即删除它的 `peerState`**。否则 `blockIp` 失败（ipset 临时故障）时，下一轮 `wait` 仍超过阈值，每轮都会重复触发封禁和失败日志。
+12. **`keywordMatches` 显式跳过 `unknown` 关键字**。未知客户端只能通过 `hasUnknownKeyword(...) && c.client === 'unknown'` 命中，block 和 noprogress 两条路径都是这样。
+13. **关键词只与 `origin` 比对，所以表外的 Az 格式 peerId 也要有 `origin`**。`detectPeerClient` 对内置表没有的 `-XX....-` 代码补上两字母 `origin`，`client` 仍是 `unknown`。否则默认关键词 `BN` 和用户自加的表外代码永远不生效。
+14. **`pieceLength` 不可知（0 或缺失）时跳过 noprogress 判定**。旧版兜底为 1，等于按字节计算，几个字节就会误封。
+15. **cron 的封禁循环里，同一 IP 只有在成功封禁后才跳过**（`isBlocked` 检查）；失败的 IP 仍允许同一轮的后续条目重试。
+16. **IPv6 关闭时 `processOnePeer` 直接跳过 IPv6 peer**。`blockIp` 不会封它们，继续跑无进度判定只会反复打出没有生效的封禁日志。
 
-8. **错误日志必须经 `sanitizeError`**（[app.js:240-258](app.js#L240-L258)）。请求体里有 `token:secret`，容器日志常被采集，泄漏 secret 是 P0。
+### 防火墙
 
-9. **cron 部分失败时不能清 `peerState`**（[app.js:662-667](app.js#L662-L667)），只有 `fullySucceeded` 才调 `cleanupPeerState`。部分失败时活跃集合不完整，全清会把 noprogress 累计计数白白重置。
+17. **aria2b 只管理 `bt_blacklist` / `bt_blacklist6` 两个 set 和引用它们的 INPUT DROP 规则**。不 flush 全局表，不改 Docker 链，不改默认策略。
+18. **`ipset add` 必须带 `-exist`**，重复添加时刷新 timeout，让本地缓存与 ipset 的时钟一致。
+19. **set 已存在时仍要调用 `ensureIptablesRule()`**（先 `-C` 检查，缺失再 `-I`）。上次启动若在 `ipset create` 之后、`iptables -I` 之前被 SIGKILL，规则会永远缺失，aria2b 正常运行却一个 IP 都拦不住。
+20. **iptables 后端探测顺序：默认二进制 → `-legacy`，不自动 `apk add`**。
+    - 探针是 `bin -L INPUT -n`：不依赖扩展模块；`-n` 避免容器无 DNS 时阻塞。
+    - 探测结果写入 `iptablesBinaries.v4/v6`，后续所有 iptables 调用都从这里读取。
+    - 安装提示统一写 `apk add --no-cache iptables iptables-legacy ipset nodejs`。Alpine 3.23 的 `iptables-legacy` 包已包含 `ip6tables-legacy`，不存在单独的 `ip6tables-legacy` 包。
+21. **IPv6 初始化失败只降级 IPv6，不影响 IPv4**。探测失败或 flush/ensure 抛错时设 `config.ipv6 = false`，下游都读这个值。刚 flush 过、或初始化失败的 set 不能从启动快照同步（`v4Flushed` / `v6Flushed` 控制），否则缓存显示"已封"而 ipset 实际为空，这些 peer 永远拦不住。
+22. **启动读取 `ipset save` 必须走 `readIpsetSave()`，并保留 32MB `maxBuffer`**。host 网络模式下能看到宿主机的全部 ipset，Node 默认 1MB buffer 会让 aria2b 误进暂停状态。
+23. **新建 set 带 `maxelem MAX_BLOCKED_IPS`**，与本地缓存上限一致（ipset 默认 65536）。已存在的 set 不会重建，只有 `--flush` 才会用上新参数。
+24. **封禁时长不能超过 `MAX_TIMEOUT_SECONDS`（2147483，ipset 上限）**。`applyCliConfig` 在配置文件和 CLI 合并完之后夹到上限并警告；超出时 `ipset create` 会失败并误进暂停状态，`ipset add` 则每次都失败。
 
-10. **`ipset add` 用 `-exist`**（[app.js:539](app.js#L539)），让重复添加刷新 timeout，本地缓存与 ipset 时钟保持一致。
+### 配置 / CLI
 
-11. **`processOnePeer` 进入 `banQueue` 即清 `peerState[stateKey]`**（[app.js:609-614](app.js#L609-L614)）。否则 `blockIp` 失败（ipset 临时故障）时 `rememberBlocked` 不会被调用，下次扫描 `wait` 仍 > 阈值会立刻再次触发 ban，每次扫描重复打"传输了 X piece"+"ipset add 失败"。清 state 给重试一个 `noprogress_wait` 次的回退窗口。
-
-12. **RPC 绝对超时必须覆盖到 body 收完**（[app.js:402-417](app.js#L402-L417)），不能在 `req.on('response')` 就清 timer。服务器可能只回 headers 然后 hang 住不发 body（aria2 内部死锁 / 慢速攻击 / 中间链路故障），那样 cron 会永久挂死。只在 `req.on('close')` / `req.on('error')` 清。
-
-13. **`installSignalHandlers` 必须在 `initial()` 的第一个 `await` 之前装好**（[app.js:914-919](app.js#L914-L919)）。启动阶段会 await `ipset save` / `flushIptablesIpset` 等子进程，没有 handler 时 docker stop 会用 default SIGTERM 直接 kill 进程，可能让 ipset 处于半初始化状态（destroy 完成但 create 未跑）。`stop()` 引用的 `scanTimer` / `rpcClient` / `cronInflight` 都是 null-safe，可以提前装。
-
-14. **iptables 规则自愈：set 存在时仍要 `ensureIptablesRule()`**（[app.js:502-518](app.js#L502-L518)）。前次启动如果在 `ipset create` 之后、`iptables -I` 之前被 SIGKILL 打断，`hasIpset` 返回 true → 跳过 flush → 规则永远不会被装上，aria2b 跑得欢快但实际一个 IP 都拦不住。`iptables -C` 检查规则在不在，不在则幂等 `-I` 补装。`-C` 是 docker alpine 上的标准选项。
-
-15. **启动阶段环境不可用时必须进 `runIdleMode()`，绝不 `process.exit(1)`**（[app.js:642-678](app.js#L642-L678)）。aria2b 在 docker-aria2 镜像里是 s6-overlay v2 的一个 service，进程退出会触发 s6 默认策略"无限重启" —— 每 1-2 秒拉起一次。如果环境本身不兼容（群晖 DSM 4.x 内核 + iptables-nft、缺 NET_ADMIN、ipset 二进制缺失、未捕获异常），exit 会把日志淹没、占满 fork 配额、拖慢同容器里的 aria2c。`runIdleMode` 用一个 refed `setInterval`（1h 心跳，**不**能 unref，否则进程会因无 refed handle 静默 exit 重蹈第 1 条覆辙）让事件循环保活、每小时打一次修复提示；同时清掉 `scanTimer` + destroy `rpcClient` 停止 cron 调度。对用户日志不要写抽象模式名，要直接说明"启动环境不可用、已暂停扫描、aria2c 不受影响、修复后重启容器"。相关入口：IPv4 后端探测失败 / ipset save 失败 / `initial()` 兜底 catch / uncaughtException / unhandledRejection。`scheduleNext` 也要看 `idleHeartbeat` 跳过装回 timer。SIGTERM/SIGINT 处理器要 `clearInterval(idleHeartbeat)` 后正常 exit(0)。
-
-16. **iptables 后端探测优先级：默认 → legacy，不自动 apk add**（[app.js:538-571](app.js#L538-L571)）。Alpine 3.13+ 的 `iptables` 包默认指向 nft 后端；群晖 DSM 4.x 内核上 nft 子系统初始化即失败（`Could not fetch rule set generation id`）。`pickIptablesBackendForVersion()` 先用 `bin -L INPUT -n` 作为最小探针（不依赖 ipset/任何扩展模块，且 `-n` 跳过反向 DNS 防容器无 DNS 时阻塞 30s+）探测默认；失败再探 `iptables-legacy`。结果写入全局 `iptablesBinaries.v4/v6`，后续 `flushIptablesIpset` / `ensureIptablesRule` 都读这个 map。Alpine 3.23 中 `iptables` 包提供 `iptables` + `ip6tables`，`iptables-legacy` 包提供 `iptables-legacy` + `ip6tables-legacy`；没有独立 `ip6tables-legacy` 包，Dockerfile 提示必须写 `apk add --no-cache iptables iptables-legacy ipset nodejs`。设计选择：**不在 aria2b 里自动 `apk add iptables-legacy`** —— 违反零运维原则（需要网络 + root + 增加启动延迟），只让用户在 Dockerfile 里装好，aria2b 自己探测切换。
-
-17. **IPv6 setup 失败必须软降级，绝不让 IPv4 跟着挂**（[app.js:1130-1156](app.js#L1130-L1156)）。群晖 DSM 4.4 内核环境下 `ip6tables -m set` 即便切到 legacy 也可能因 xt_set 模块对 IPv6 路径残缺而失败。v2.1 之前 v6 抛错让进程 exit，s6 重启第二轮 IPv4 才幸运通过 —— 这是 v1.x"误打误撞跑成"的 race 路径，v2.1 加 `ensureIptablesRule` 自愈反而把这个 race 关死了。现在：v6 探测失败 → `config.ipv6=false`；v6 flush/ensure 抛错 → catch + `config.ipv6=false`。降级信号统一通过 `config.ipv6` 传给下游（`blockIp` / `syncBlockedIpsFromIpset` / cron 都读它）。已被 flush 但中途失败的 v6 set 不能 sync（`v6Flushed=false` 后续 syncTargets 跳过），否则缓存说"已封"但 ipset 已空 → cron `isBlocked=true` 跳过 peer → 永远拦不住。
-
-18. **启动读取 `ipset save` 必须走 `readIpsetSave()` 并保留 32MB `maxBuffer`**（[app.js:706](app.js#L706)）。docker-aria2 a2b variant 常用 `network_mode: host` + `NET_ADMIN`，aria2b 看到的是当前网络命名空间里的全部 ipset；长期运行黑名单较大时，Node `execFile` 默认 1MB stdout buffer 会杀掉子进程，让 aria2b 误进入"暂停扫描并保活"状态。不要为这个低频启动路径引入流式解析；除非有真实宿主大型 ipset 反馈，否则 32MB buffer 是当前最小修复。
-
-19. **`system.multicall` 子调用 fault / 结果缺失必须视为部分失败，不能清 `peerState`**（[app.js:817](app.js#L817)）。aria2c 任务状态变化时，单个 `tellStatus` / `getPeers` 可能返回 `{ faultCode, faultString }` 或缺结果；这种情况下活跃集合不完整，本轮跳过对应 gid，并保持 `fullySucceeded=false`。只有结果长度匹配且每个子调用成功时才允许 `cleanupPeerState(activeKeys)`。
+25. **`parseArgv` 不做类型转换**，值只会是字符串或 `true`。`--secret 001234` 必须保留前导 0；数字字段在 `applyCliConfig` 里通过 `applyPositiveIntegerConfig` 各自转换。
+26. **不带值的参数（值为 `true`）不能写进配置**：`parsePositiveInteger` 拒绝 boolean（`Number(true) === 1`）；字符串参数经 `cliString` 忽略并警告（否则 secret 会变成 `"true"`）；`-c` 不带路径按"路径为空"处理。
+27. **aria2.conf 的 `disable-ipv6` 只能关闭 IPv6**，不能覆盖 `detectIpv6Enabled()` 的结果去强制开启。`disable-ipv6=false` 是 aria2 的默认值。
+28. **显式 `-c` 指定的配置文件不可用时进入暂停状态**（`--flush` 时 exit 1），不回落到默认 RPC 配置继续运行。
+29. **寄生配置不支持行尾 `#` 注释**（`parseConfigLine` 只跳过整行注释），README 已说明。
 
 ## 测试约定
 
-- 用 `node:test` + `node:assert/strict`，不用第三方框架（保持依赖最少）
-- [test/cron.test.js](test/cron.test.js) 通过 `http.createServer` 起 mock aria2 RPC + monkey-patch `runtime.execFile` spy 来端到端验证主循环
-- [test/rpc.test.js](test/rpc.test.js) 直接测 `httpJsonPost`：4xx/3xx/5xx、ECONNREFUSED、绝对超时、JSON 解析失败、64MB body 上限、keep-alive 复用、自签 TLS、`destroy()` 中断 in-flight
-- [test/iptables.test.js](test/iptables.test.js) 覆盖 ipset / iptables setup、后端探测、启动环境不可用时暂停扫描并保活，以及启动 `ipset save` buffer 约束
-- 上面列的每个"关键不变量"都有对应回归测试，改相关代码必须先看测试再动
-- `_internal._reset()` 在测试 setup 里调用，重置全局 config / blockedIps / peerState
+- 只用 `node:test` + `node:assert/strict`，不引入第三方测试框架。
+- 每个用例的 setup 调用 `_internal._reset()`，重置 config / 两个 Map / iptables 后端 / idle 心跳 / 失败计数。会装定时器的用例要自行清理，否则 `node --test` 不会退出。
+- [test/cron.test.js](test/cron.test.js)：用 `http.createServer` 模拟 aria2 RPC，把 `runtime.execFile` 换成 spy，端到端验证主循环。
+- [test/rpc.test.js](test/rpc.test.js)：`httpJsonPost` 的错误契约（3xx/4xx/5xx、ECONNREFUSED、各阶段超时、非法 JSON、64MB 上限、keep-alive、`destroy()`、自签 TLS、IPv6 字面量）。
+- [test/iptables.test.js](test/iptables.test.js)：ipset / iptables 初始化、后端探测与切换、IPv6 路径、暂停状态、`ipset save` buffer。
+- [test/config.test.js](test/config.test.js) / [test/parseargv.test.js](test/parseargv.test.js)：寄生配置、CLI 解析与合并。
+- [test/cli.test.js](test/cli.test.js)：以子进程运行 `-h` / `-v` / `--flush`。
+- [test/unit.test.js](test/unit.test.js)：纯函数与状态管理。
+- 修 bug 时补一条能复现原问题的回归测试。
 
 ## 环境与运行依赖
 
-- **Node.js ≥ 22**（package.json engines: `>=22 <25`）。CI 矩阵覆盖 22 / 24
-- 系统依赖：`ipset` `iptables`（以及 IPv6 的 `ip6tables`）。Docker 内需要 `NET_ADMIN` capability，**不**用 `--privileged`
-- IPv6 由 `detectIpv6Enabled()` 自动探测 `/sys/module/ipv6/parameters/disable` / `/proc/net/if_inet6`；aria2.conf 里 `disable-ipv6=true` 时跟随关闭
-- 环境变量：`DEV=1` 打 debug 日志；`HIDE_TIME_PREFIX=1` 让日志不带时间前缀（s6/journalctl 外部 logger 已经加时间）
+- Node.js 22–24（`engines: >=22 <25`），CI 覆盖 22 / 24；release 以 `--target=node22` 打包。
+- 系统依赖：`ipset`、`iptables`（IPv6 还需要 `ip6tables`）。Docker 内需要 `NET_ADMIN` capability，**不**用 `--privileged`。
+- IPv6 启用判断：`detectIpv6Enabled()` 只检查 `/proc/net/if_inet6` 是否存在（该文件按网络命名空间区分，禁用 IPv6 时内核不会创建）；aria2.conf 里 `disable-ipv6=true` 时跟随关闭。
+- 环境变量：`DEV=1` 输出 debug 日志；`HIDE_TIME_PREFIX=1` 日志不带时间前缀。
+- 面向用户的日志和文档用中文，直接描述现象与修复方法。
