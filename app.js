@@ -920,6 +920,7 @@ function hasIpset(saveOutput, setName) {
 function sanitizeError(e) {
     if (!e) return 'unknown error'
     if (typeof e === 'string') return e
+    if (typeof e.cmd === 'string' || typeof e.stderr === 'string') return summarizeCommandError(e)
     if (e.code === 'ECONNREFUSED') {
         const addr = (e.address && e.port) ? `${e.address}:${e.port}` : ''
         return `RPC 拒绝连接 ${addr}`.trim()
@@ -935,6 +936,20 @@ function sanitizeError(e) {
         return `HTTP ${status} ${statusText || ''}`.trim()
     }
     return e.message || 'unknown error'
+}
+
+/**
+ * iptables / ipset 子进程错误的一行摘要。原始 message 是 "Command failed: <命令>\n<stderr>"
+ * 多行文本，直接打日志会被误读成好几条错误。命令不存在时说明缺哪个命令；否则取 stderr 中
+ * 第一行有效信息，跳过 "Warning:" / "Perhaps ..." / "Try `iptables -h' ..." 这类附加行。
+ */
+function summarizeCommandError(e) {
+    if (e.code === 'ENOENT') return `找不到命令 ${e.path || ''}`.trim()
+    const lines = String(e.stderr || '').split('\n').map(x => x.trim()).filter(Boolean)
+    const useful = lines.filter(x => !/^(Warning:|Perhaps |Try `)/.test(x))
+    if (useful.length) return useful[0]
+    if (lines.length) return lines[0]
+    return String(e.message || 'unknown error').split('\n')[0]
 }
 
 function maskSecret(s) {
@@ -1191,27 +1206,61 @@ const iptablesBinaries = {
     v6: 'ip6tables'
 }
 
+const APK_INSTALL_FIX = '在 Dockerfile 增加 `apk add --no-cache iptables iptables-legacy ipset nodejs` 后重启容器'
+const NET_ADMIN_FIX = '给容器加上 NET_ADMIN 能力（docker run --cap-add=NET_ADMIN，compose 中 cap_add: [NET_ADMIN]）后重启容器'
+
 /**
- * 在 iptables/ipset 子进程报错文本里识别 iptables-nft 后端在老内核（Synology DSM 4.x
- * 内核 / 部分 NAS 固件）下的特征错误，给用户一个可操作的修复路径。
- * 命中任意一条特征就在日志里追加"切到 legacy 后端"的建议，不命中则保持原错误信息。
- *
- * 这些特征都来自实战日志：
- *   `nf_tables`                                — iptables-nft 后端 banner
- *   `Could not fetch rule set generation id`   — nft 内核子系统未初始化好
- *   `Extension set revision 0 not supported`   — xt_set 内核模块缺失/版本不匹配
- *   `Couldn't load match 'set'`                — 同上，老 ip6tables 报错形态
- *   `missing kernel module`                    — iptables 兜底提示
+ * 把 iptables / ipset 子进程的失败归类，用来给出对症的提示。特征都来自实测日志：
+ *   permission  缺 NET_ADMIN：`Permission denied (you must be root)` / `Operation not permitted`。
+ *               nft 后端此时同样报 "Could not fetch rule set generation id"，所以必须先判断权限。
+ *   nft         nft 后端在群晖 DSM 等旧内核上无法初始化：`(nf_tables): Could not fetch rule set generation id`
+ *   set-match   内核缺 xt_set（`-m set` 不可用）：`Couldn't load match `set'` / `Extension set ... not supported`
+ *   missing     命令不存在（ENOENT）
  */
-function looksLikeNftBackendIssue(err) {
-    const text = `${err && err.stderr || ''}\n${err && err.message || ''}`
-    return /nf_tables|generation id|Extension set|missing kernel module|Couldn't load match/i.test(text)
+function classifyFirewallError(e) {
+    if (!e) return 'other'
+    if (e.code === 'ENOENT') return 'missing'
+    const text = `${e.stderr || ''}\n${e.message || ''}`
+    if (/Permission denied|Operation not permitted|must be root/i.test(text)) return 'permission'
+    if (/nf_tables|generation id/i.test(text)) return 'nft'
+    if (/Extension set|Couldn't load match|missing kernel module/i.test(text)) return 'set-match'
+    return 'other'
 }
 
-function logIptablesBackendHint() {
-    honsole.error('诊断：错误信号疑似 iptables-nft 后端 / xt_set 内核模块不兼容（常见于 Synology DSM 4.x 等老内核）。')
-    honsole.error('修复：在镜像里安装 iptables-legacy 后 aria2b 会自动探测并切换：')
-    honsole.error('      apk add --no-cache iptables iptables-legacy ipset nodejs')
+// 默认与 legacy 后端都探测失败时的原因和处理建议；只在确实缺包时才建议安装 iptables-legacy。
+function describeBackendFailure(defaultBin, legacyBin, defaultErr, legacyErr) {
+    const d = classifyFirewallError(defaultErr)
+    const l = classifyFirewallError(legacyErr)
+    if (d === 'permission' || l === 'permission') {
+        const e = d === 'permission' ? defaultErr : legacyErr
+        return { reason: `没有操作防火墙的权限（${sanitizeError(e)}）`, fix: NET_ADMIN_FIX, installable: false }
+    }
+    if (l === 'missing' && d === 'missing') {
+        return { reason: `找不到 ${defaultBin} 命令`, fix: APK_INSTALL_FIX, installable: true }
+    }
+    if (l === 'missing' && d === 'nft') {
+        return { reason: `当前内核不支持默认 ${defaultBin} 使用的 nft 后端，镜像里也没有 ${legacyBin}`, fix: APK_INSTALL_FIX, installable: true }
+    }
+    return {
+        reason: `${defaultBin} 和 ${legacyBin} 都无法使用（${defaultBin}：${sanitizeError(defaultErr)}；${legacyBin}：${sanitizeError(legacyErr)}）`,
+        fix: '确认容器具备 NET_ADMIN 能力、宿主机内核支持 iptables 后重启容器',
+        installable: false
+    }
+}
+
+// 后端已选定，但建 set / 装规则失败时的原因和处理建议。
+function describeSetupFailure(version, e) {
+    const bin = version === 6 ? iptablesBinaries.v6 : iptablesBinaries.v4
+    switch (classifyFirewallError(e)) {
+        case 'permission':
+            return { reason: `没有操作防火墙的权限（${sanitizeError(e)}）`, fix: NET_ADMIN_FIX }
+        case 'set-match':
+            return { reason: `当前内核不支持 ${bin} 的 ipset 匹配（xt_set）`, fix: '需要宿主机内核提供 xt_set 模块，容器内无法修复' }
+        case 'missing':
+            return { reason: sanitizeError(e), fix: APK_INSTALL_FIX }
+        default:
+            return { reason: sanitizeError(e), fix: '确认容器具备 NET_ADMIN 能力、宿主机内核已加载 ip_set / xt_set 模块后重启容器' }
+    }
 }
 
 /**
@@ -1247,50 +1296,72 @@ async function pickIptablesBackendForVersion(version) {
     try {
         await probeIptablesBinary(defaultBin)
         iptablesBinaries[key] = defaultBin
-        return true
+        return { ok: true, bin: defaultBin, switched: false }
     } catch (e) {
         defaultErr = e
-        // 默认探测失败的两种情况都试 legacy 兜底：
-        //   1. 二进制不存在（ENOENT）—— 不太可能，但保留
-        //   2. nft 后端实际工作不了（typical 群晖 DSM 4.x）
-        // 非 nft 错误（例如 NET_ADMIN 缺失导致权限报错）也试一下 legacy，
-        // 因为 legacy 也会在同样原因下失败，那时统一返回 false 给上层提示。
+        honsole.dev(`${defaultBin} 探测失败：`, sanitizeError(e))
     }
 
+    // 默认探测失败的任何原因都再试 legacy：典型是群晖 DSM 等旧内核上 nft 后端无法初始化；
+    // 权限不足时 legacy 也会以同样原因失败，由 describeBackendFailure 给出 NET_ADMIN 提示。
     try {
         await probeIptablesBinary(legacyBin)
-        iptablesBinaries[key] = legacyBin
-        honsole.log(`IPv${version} iptables 后端切换到 ${legacyBin}（默认 ${defaultBin} 在此内核不可用：${sanitizeError(defaultErr)}）`)
-        return true
     } catch (legacyErr) {
-        honsole.warn(`IPv${version} iptables 探测失败：${defaultBin} 报 "${sanitizeError(defaultErr)}"，${legacyBin} 报 "${sanitizeError(legacyErr)}"`)
-        if (looksLikeNftBackendIssue(defaultErr) || looksLikeNftBackendIssue(legacyErr)) {
-            logIptablesBackendHint()
-        }
-        return false
+        honsole.dev(`${legacyBin} 探测失败：`, sanitizeError(legacyErr))
+        return { ok: false, ...describeBackendFailure(defaultBin, legacyBin, defaultErr, legacyErr) }
+    }
+    iptablesBinaries[key] = legacyBin
+    // 切换是能正常运行的预期情况，由 reportBackendSwitch 打一行普通提示；原始报错在 DEV=1 时可见。
+    return {
+        ok: true,
+        bin: legacyBin,
+        switched: true,
+        nftUnsupported: classifyFirewallError(defaultErr) === 'nft',
+        defaultBin,
+        defaultError: sanitizeError(defaultErr)
+    }
+}
+
+/**
+ * 后端切换是能正常运行的情况（典型是群晖等旧内核不支持 nft 后端），只打一行普通提示，
+ * 按探测到的防火墙类型说明切换到了哪个二进制，不打警告或报错。
+ */
+function reportBackendSwitch(backends) {
+    const switched = backends.filter(b => b && b.ok && b.switched)
+    const nft = switched.filter(b => b.nftUnsupported).map(b => b.bin)
+    if (nft.length) honsole.log(`检测到当前内核不支持 nft 防火墙后端，已切换到 ${nft.join(' / ')}`)
+    for (const b of switched) {
+        if (!b.nftUnsupported) honsole.log(`默认的 ${b.defaultBin} 无法使用（${b.defaultError}），已切换到 ${b.bin}`)
+    }
+}
+
+/**
+ * IPv6 探测或初始化失败、已降级为仅 IPv4。内核不支持属于用户无法改变、也不影响运行的情况，
+ * 只打普通提示；只有确实缺软件包（用户能自己修）时才用警告并给出修复方法。
+ */
+function reportIpv6Unavailable(failure) {
+    if (failure.installable) {
+        honsole.warn(`IPv6 封禁未启用（IPv4 不受影响）：${failure.reason}。如需 IPv6 封禁，${failure.fix}。`)
+    } else {
+        honsole.log(`IPv6 封禁未启用：${failure.reason}，仅启用 IPv4 封禁`)
     }
 }
 
 async function flushIptablesIpset(version) {
     const iptables = version === 6 ? iptablesBinaries.v6 : iptablesBinaries.v4
     const setName = version === 6 ? IPSET_NAME_V6 : IPSET_NAME_V4
-    try {
-        // 删除旧规则与 ipset；首次运行没有这些是正常的，吞错误
-        await runtime.execFile(iptables, ['-D', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP']).catch(() => {})
-        await runtime.execFile('ipset', ['destroy', setName]).catch(() => {})
+    // 删除旧规则与 ipset；首次运行没有这些是正常的，吞错误
+    await runtime.execFile(iptables, ['-D', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP']).catch(() => {})
+    await runtime.execFile('ipset', ['destroy', setName]).catch(() => {})
 
-        const createArgs = ['create', setName, 'hash:ip', 'timeout', String(config.timeout), 'maxelem', String(MAX_BLOCKED_IPS)]
-        if (version === 6) createArgs.push('family', 'inet6')
-        await runtime.execFile('ipset', createArgs)
-        await runtime.execFile(iptables, ['-I', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP'])
+    // create / -I 失败直接抛出，不在这里打日志：IPv4 失败由 initial() 进暂停状态，
+    // IPv6 失败只降级，各自用 describeSetupFailure 说明原因。
+    const createArgs = ['create', setName, 'hash:ip', 'timeout', String(config.timeout), 'maxelem', String(MAX_BLOCKED_IPS)]
+    if (version === 6) createArgs.push('family', 'inet6')
+    await runtime.execFile('ipset', createArgs)
+    await runtime.execFile(iptables, ['-I', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP'])
 
-        honsole.log(`已初始化 ${setName}（IPv${version}，使用 ${iptables}）`)
-    } catch (e) {
-        honsole.error(`初始化 ${setName} 失败：${sanitizeError(e)}`)
-        honsole.error('请确认：容器具备 NET_ADMIN，已安装 iptables/ipset，且内核已加载对应模块')
-        if (looksLikeNftBackendIssue(e)) logIptablesBackendHint()
-        throw e
-    }
+    honsole.log(`已初始化 ${setName}（IPv${version}，使用 ${iptables}）`)
 }
 
 /**
@@ -1314,13 +1385,8 @@ async function ensureIptablesRule(version) {
         // 那种情况后续的 -I 也会失败并抛出更明确的 nft 信号，由 initial() 的 IPv6 try/catch
         // 决定降级/退出，这里不必区分 -C 失败的根因。
     }
-    try {
-        await runtime.execFile(iptables, ['-I', ...ruleArgs])
-    } catch (e) {
-        honsole.error(`补装 ${iptables} 规则（${setName}）失败：${sanitizeError(e)}`)
-        if (looksLikeNftBackendIssue(e)) logIptablesBackendHint()
-        throw e
-    }
+    // -I 失败直接抛出，由 initial() 用 describeSetupFailure 说明（同 flushIptablesIpset）
+    await runtime.execFile(iptables, ['-I', ...ruleArgs])
     honsole.log(`已补装 ${iptables} 规则（${setName} 引用，前次启动可能被中断）`)
     return true
 }
@@ -1341,21 +1407,24 @@ async function ensureIptablesRule(version) {
  * 不再执行任何 ipset/iptables 操作。aria2c 主服务不受影响。
  * 每小时打一次提醒日志告诉用户问题仍未修复 —— 避免日志膨胀，又不让人遗忘。
  */
-function runIdleMode(reason) {
+function runIdleMode(reason, fix = '修复后重启容器') {
     if (idleHeartbeat) return   // 防止重复进入
 
     // `--flush` 是一次性 CLI 维护命令（手动跑，不是 s6 service），失败时应该 exit 非 0
     // 让调用者立刻知道，而不是静默保活让用户怀疑命令卡死。runIdleMode 只服务于 s6 长期托管路径。
     if (argv && argv.flush) {
         honsole.error(`--flush 失败：${reason}`)
+        honsole.error(`处理：${fix}`)
         process.exit(1)
         return   // 测试里 process.exit 被 mock 时让函数提前结束，避免继续装 idleHeartbeat
     }
 
-    honsole.error('aria2b 启动环境不可用，已暂停扫描并保持进程运行，避免容器反复重启。')
+    // 处理建议由调用方按具体原因给出，不能一律提示安装 iptables-legacy（配置文件写错、
+    // 缺 NET_ADMIN、程序异常时这条建议都是误导）。
+    honsole.error('aria2b 无法正常工作，已暂停扫描并保持进程运行，避免容器反复重启。')
     honsole.error(`原因：${reason}`)
     honsole.error('影响：aria2b 暂时不会封禁 peer；aria2c / AriaNg 不受影响。')
-    honsole.error('处理：修复环境后重启容器。常见修复：在 Dockerfile 增加 `apk add --no-cache iptables iptables-legacy ipset nodejs`。')
+    honsole.error(`处理：${fix}`)
 
     // 暂停扫描并保活可能在 cron 运行期间被 uncaughtException 触发：必须立刻停掉调度循环，
     // 否则 cron 会在 idleHeartbeat 装好后继续每 N 秒跑一次，徒增 RPC / 子进程开销。
@@ -1371,7 +1440,7 @@ function runIdleMode(reason) {
     idleHeartbeat = setInterval(() => {
         // 不 unref：CLAUDE.md 第 1 条不变量说事件循环里必须有 refed handle，
         // 否则 Node 会在 keep-alive 池超时后静默 exit(0) → s6 重启 → crash-loop 复发。
-        honsole.error(`aria2b 仍因启动环境不可用而暂停扫描（${reason}）—— 修复后请重启容器`)
+        honsole.error(`aria2b 仍处于暂停扫描状态。原因：${reason}。处理：${fix}`)
     }, HOUR)
 }
 
@@ -1826,11 +1895,11 @@ function installSignalHandlers() {
     // 同容器里 aria2c / AriaNg 继续工作；用户能从日志里看到 stack trace 修 bug）。
     process.on('uncaughtException', e => {
         try { honsole.error('uncaughtException:', sanitizeError(e)) } catch (_) {}
-        if (!idleHeartbeat) runIdleMode(`uncaughtException: ${sanitizeError(e)}`)
+        if (!idleHeartbeat) runIdleMode(`uncaughtException: ${sanitizeError(e)}`, '这是 aria2b 的程序错误，请把这段日志反馈给维护者；重启容器可暂时恢复')
     })
     process.on('unhandledRejection', e => {
         try { honsole.error('unhandledRejection:', sanitizeError(e)) } catch (_) {}
-        if (!idleHeartbeat) runIdleMode(`unhandledRejection: ${sanitizeError(e)}`)
+        if (!idleHeartbeat) runIdleMode(`unhandledRejection: ${sanitizeError(e)}`, '这是 aria2b 的程序错误，请把这段日志反馈给维护者；重启容器可暂时恢复')
     })
 }
 
@@ -1858,10 +1927,10 @@ async function initial() {
     if (cfgPath) {
         const loaded = loadConfigFromAria2File(cfgPath)
         if (!loaded && explicitConfigPath) {
-            return runIdleMode(`显式指定的配置文件不可用：${cfgPath}`)
+            return runIdleMode(`显式指定的配置文件不可用：${cfgPath}`, '检查 -c 参数指定的 aria2 配置文件后重启容器')
         }
     } else if (explicitConfigPath) {
-        return runIdleMode('显式指定的配置文件路径为空')
+        return runIdleMode('显式指定的配置文件路径为空', '检查 -c 参数指定的 aria2 配置文件后重启容器')
     }
 
     applyCliConfig()
@@ -1873,9 +1942,11 @@ async function initial() {
     try {
         ipsetSave = await readIpsetSave()
     } catch (e) {
-        honsole.error(`执行 ipset save 失败：${sanitizeError(e)}`)
-        honsole.error('请确认容器具备 NET_ADMIN 能力且已安装 ipset')
-        return runIdleMode(`ipset 不可用：${sanitizeError(e)}`)
+        const kind = classifyFirewallError(e)
+        const fix = kind === 'missing' ? APK_INSTALL_FIX
+            : kind === 'permission' ? NET_ADMIN_FIX
+                : '确认容器具备 NET_ADMIN 能力、宿主机内核已加载 ip_set 模块后重启容器'
+        return runIdleMode(`ipset 无法使用：${sanitizeError(e)}`, fix)
     }
 
     // 探测 iptables 后端：Alpine 3.13+ 的 `iptables` 包默认指向 nft 后端，
@@ -1883,15 +1954,17 @@ async function initial() {
     // 这里探测默认能否工作，不行就尝试切到 `iptables-legacy`（前提是镜像装了 iptables-legacy 包）。
     //   IPv4 失败 → 暂停扫描并保活（绝不 process.exit，否则会触发 s6 crash-loop 拖死容器）
     //   IPv6 失败 → 软降级：仅 IPv4 仍然能干活，给用户明确提示
-    if (!await pickIptablesBackendForVersion(4)) {
-        return runIdleMode('IPv4 iptables 后端不可用（默认 nft 与 iptables-legacy 都无法工作）。修复：在镜像里装 iptables-legacy 包；若已装请检查容器 NET_ADMIN capability 与内核 ipset 模块')
+    const v4Backend = await pickIptablesBackendForVersion(4)
+    if (!v4Backend.ok) return runIdleMode(`IPv4 防火墙不可用：${v4Backend.reason}`, v4Backend.fix)
+    let v6Backend = null
+    if (config.ipv6) {
+        v6Backend = await pickIptablesBackendForVersion(6)
+        if (!v6Backend.ok) {
+            reportIpv6Unavailable(v6Backend)
+            config.ipv6 = false
+        }
     }
-    if (config.ipv6 && !await pickIptablesBackendForVersion(6)) {
-        honsole.warn('IPv6 iptables 后端不可用，自动降级为仅 IPv4 模式继续运行（IPv4 拦截不受影响）。')
-        honsole.warn('若需启用 IPv6 拦截，请在镜像里装 iptables-legacy（Alpine 3.23 中它同时提供 ip6tables-legacy）；')
-        honsole.warn('若本就不需要 IPv6，可在 aria2.conf 设 disable-ipv6=true 消除此警告。')
-        config.ipv6 = false
-    }
+    reportBackendSwitch([v4Backend, v6Backend])
 
     let v4Flushed = false
     let v6Flushed = false
@@ -1907,7 +1980,8 @@ async function initial() {
     } catch (e) {
         // 探测通过但 flush/ensure 阶段失败（典型场景：xt_set 模块在该内核完全残缺，
         // 即便 legacy 后端也救不了）→ 同样暂停扫描并保活而不是 crash。
-        return runIdleMode(`IPv4 ipset/iptables 初始化失败：${sanitizeError(e)}`)
+        const failure = describeSetupFailure(4, e)
+        return runIdleMode(`IPv4 防火墙初始化失败：${failure.reason}`, failure.fix)
     }
     // IPv6 setup 即便后端探测通过，xt_set 实际加载 `-m set` 仍可能失败（内核 xt_set 模块
     // 残缺）。这里再套一层 try/catch 兜底：v6 在 flush/ensure 阶段抛错时同样软降级为仅 IPv4。
@@ -1921,8 +1995,8 @@ async function initial() {
             } else {
                 await ensureIptablesRule(6)
             }
-        } catch (_e) {
-            honsole.warn('IPv6 ipset/iptables 初始化失败（后端探测通过但 xt_set 实际加载失败），自动降级为仅 IPv4 模式。')
+        } catch (e) {
+            reportIpv6Unavailable({ ...describeSetupFailure(6, e), installable: false })
             config.ipv6 = false
             v6Flushed = false   // 没初始化过的 set 别 sync，避免假装"已封"
         }
@@ -1958,7 +2032,7 @@ if (require.main === module) {
         try { honsole.error('启动失败：', sanitizeError(e)) } catch (_) {}
         // 启动阶段未捕获异常（initial 内部应该都 try 过了，这里是兜底）：暂停扫描并保活
         // 而不是 exit，避免 s6-overlay v2 反复重启容器服务（参见 runIdleMode 注释）。
-        runIdleMode(`启动异常：${sanitizeError(e)}`)
+        runIdleMode(`启动异常：${sanitizeError(e)}`, '检查 aria2b 的启动参数和 aria2 配置后重启容器')
     })
 }
 
@@ -1985,7 +2059,8 @@ module.exports = {
         parseArgv, applyCliConfig, applyNoVerify, loadConfigFromAria2File,
         // ipset / iptables
         iptablesBinaries,
-        looksLikeNftBackendIssue,
+        classifyFirewallError, describeBackendFailure, describeSetupFailure,
+        reportBackendSwitch, reportIpv6Unavailable,
         probeIptablesBinary, pickIptablesBackendForVersion,
         flushIptablesIpset, ensureIptablesRule, blockIp,
         runIdleMode,

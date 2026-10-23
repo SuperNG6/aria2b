@@ -11,6 +11,18 @@
 - aria2.conf 中的 `disable-ipv6=false`（aria2 默认值）不再覆盖系统探测结果强制开启 IPv6。此前在无 IPv6 的主机上会去探测 `ip6tables`，失败后降级并多打 3 行警告；现在 `disable-ipv6` 只用于关闭 IPv6。
 - 新建 `bt_blacklist` / `bt_blacklist6` 时显式设置 `maxelem 200000`，与本地缓存上限一致。ipset 默认上限 65536，封禁 IP 过多时会一直报"封禁失败"。已存在的 set 不会被重建，需要执行一次 `aria2b --flush` 才会用上新上限。
 
+## 体验优化
+
+- 群晖 DSM 等老内核上，防火墙后端自动切换和 IPv6 不可用都属于能正常运行的情况，现在只打普通提示，不再输出十几行报错：
+
+  ```
+  检测到当前内核不支持 nft 防火墙后端，已切换到 iptables-legacy / ip6tables-legacy
+  IPv6 封禁未启用：当前内核不支持 ip6tables-legacy 的 ipset 匹配（xt_set），仅启用 IPv4 封禁
+  ```
+
+- iptables / ipset 报错压成一行，不再把多行原始输出直接写进日志。
+- 处理建议按实际原因给出：缺 NET_ADMIN 时提示加 NET_ADMIN（此前会被误判成 nft 不兼容并提示安装 iptables-legacy）；镜像里确实没有 iptables-legacy 时才提示安装，且只提示一次；内核缺 xt_set 时说明容器内无法修复；配置文件路径错误、程序异常各有对应提示。
+
 ## 文档
 
 - npm 上的 `aria2b` 包由上游维护，停留在 v1.0.9，不包含 v2.x 的任何修复。README 改为推荐从本仓库 release 下载单文件，或用 release 附带的 tgz 执行 `npm i -g`；仓库、下载、clone 链接改为 `SuperNG6/aria2b`。
@@ -23,7 +35,7 @@
 
 ## 测试
 
-- 128/128 通过。真实 aria2c 1.37.0 + ipset/iptables 环境验证：错误 secret 的日志、超大封禁时长的启动与建表、`BN` 关键词命中、IPv6 关闭时不再打出无效封禁日志。
+- 136/136 通过，新增启动日志端到端测试（模拟内核不支持 nft、镜像缺 iptables-legacy、容器缺 NET_ADMIN 三种环境）。真实 aria2c 1.37.0 + ipset/iptables 环境验证：错误 secret 的日志、超大封禁时长的启动与建表、`BN` 关键词命中、IPv6 关闭时不再打出无效封禁日志、缺 NET_ADMIN 时的提示。
 
 # v2.2.6
 

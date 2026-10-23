@@ -4,7 +4,7 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来。本仓库是 [makeding/aria2b](https://github.com/makeding/aria2b) 的维护分支，v2.x 版本只在本仓库发布。
 
-> **v2.2.7**：secret 错误时日志直接提示与 aria2 的 rpc-secret 不一致（此前只显示 `HTTP 400 Bad Request`）；默认关键词 `BN` 等内置表以外的客户端代码现在能命中；封禁时长超过 ipset 上限（2147483 秒）时自动调整而不是无法封禁；IPv6 关闭时不再反复打出未生效的封禁日志；`disable-ipv6=false` 不再强制开启 IPv6；新建 ipset 的 `maxelem` 调到 200000；修正安装说明（npm 上的 `aria2b` 仍是上游 v1.0.9）。
+> **v2.2.7**：群晖等老内核上防火墙后端切换、IPv6 不可用改为普通提示，不再输出报错；secret 错误时日志直接提示与 aria2 的 rpc-secret 不一致（此前只显示 `HTTP 400 Bad Request`）；默认关键词 `BN` 等内置表以外的客户端代码现在能命中；封禁时长超过 ipset 上限（2147483 秒）时自动调整而不是无法封禁；IPv6 关闭时不再反复打出未生效的封禁日志；`disable-ipv6=false` 不再强制开启 IPv6；新建 ipset 的 `maxelem` 调到 200000；修正安装说明（npm 上的 `aria2b` 仍是上游 v1.0.9）。
 >
 > **v2.2.6**：修复 IPv6 字面量 RPC 地址无法连接；加速无进度 bitfield 检查，并跳过同轮已成功封禁的重复 IP，减少 CPU 开销、子进程和重复日志。
 >
@@ -60,9 +60,14 @@ IPv6 默认根据系统 `/proc/net/if_inet6` 自动启用，对应使用 `bt_bla
 
     apk add --no-cache iptables ipset nodejs
 
-若运行在群晖 DSM 4.x 等老内核环境，建议同时安装 legacy 后端：
+若运行在群晖 DSM 等老内核环境，建议同时安装 legacy 后端：
 
     apk add --no-cache iptables iptables-legacy ipset nodejs
+
+aria2b 启动时会自动探测防火墙后端。在这类内核上看到下面两条提示属于正常情况，IPv4 封禁照常工作：
+
+    检测到当前内核不支持 nft 防火墙后端，已切换到 iptables-legacy / ip6tables-legacy
+    IPv6 封禁未启用：当前内核不支持 ip6tables-legacy 的 ipset 匹配（xt_set），仅启用 IPv4 封禁
 
 Alpine 3.23 中 `iptables` 包已提供 `ip6tables`，`iptables-legacy` 包已提供 `ip6tables-legacy`；不需要安装 `ip6tables-legacy` 这个包名。
 ### Ubuntu / Debian

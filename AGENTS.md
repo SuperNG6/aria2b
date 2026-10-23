@@ -84,7 +84,7 @@ runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退�
    - 入口：显式 `-c` 配置文件不可用、`ipset save` 失败、IPv4 iptables 后端不可用、IPv4 flush/ensure 失败、`initial()` 兜底 catch、`uncaughtException` / `unhandledRejection`。
    - `runIdleMode` 会清掉 `scanTimer`、销毁 `rpcClient`，并装一个 1 小时间隔的 refed `setInterval`（**不能** unref，理由同第 1 条）；`scheduleNext` 发现 `idleHeartbeat` 存在时不再调度。
    - 例外：`--flush` 是手动执行的一次性命令，失败时 `exit(1)`。
-   - 面向用户的日志直接说明"启动环境不可用、已暂停扫描、aria2c 不受影响、修复后重启容器"，不写抽象的模式名。
+   - `runIdleMode(reason, fix)` 的日志固定四行：已暂停扫描并保持进程运行 / 原因 / aria2c 不受影响 / 处理。`fix` 由调用方按实际原因给出（缺包、缺 NET_ADMIN、配置文件路径、程序错误各不相同），不能一律提示安装 iptables-legacy。
 3. **`installSignalHandlers()` 必须在 `initial()` 的第一个 `await` 之前调用**。否则 docker stop 可能在 `ipset destroy` 之后、`create` 之前杀掉进程。`stop()` 会清 `scanTimer` / `idleHeartbeat`、销毁 `rpcClient`，等当前 cron 结束后 `exit(0)`。
 
 ### RPC
@@ -115,18 +115,20 @@ runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退�
     - 探针是 `bin -L INPUT -n`：不依赖扩展模块；`-n` 避免容器无 DNS 时阻塞。
     - 探测结果写入 `iptablesBinaries.v4/v6`，后续所有 iptables 调用都从这里读取。
     - 安装提示统一写 `apk add --no-cache iptables iptables-legacy ipset nodejs`。Alpine 3.23 的 `iptables-legacy` 包已包含 `ip6tables-legacy`，不存在单独的 `ip6tables-legacy` 包。
-21. **IPv6 初始化失败只降级 IPv6，不影响 IPv4**。探测失败或 flush/ensure 抛错时设 `config.ipv6 = false`，下游都读这个值。刚 flush 过、或初始化失败的 set 不能从启动快照同步（`v4Flushed` / `v6Flushed` 控制），否则缓存显示"已封"而 ipset 实际为空，这些 peer 永远拦不住。
+    - `pickIptablesBackendForVersion` 只返回结果不打日志；切换到 legacy 是能正常运行的情况，由 `reportBackendSwitch` 按防火墙类型打一行普通提示（"检测到当前内核不支持 nft 防火墙后端，已切换到 …"），不打警告或报错。不专门识别群晖等具体系统。
+21. **IPv6 初始化失败只降级 IPv6，不影响 IPv4**。探测失败或 flush/ensure 抛错时设 `config.ipv6 = false`，下游都读这个值。`reportIpv6Unavailable` 负责提示：内核不支持（用户无法改变、也不影响运行）只打普通日志；只有确实缺软件包时才用警告并给出修复方法。刚 flush 过、或初始化失败的 set 不能从启动快照同步（`v4Flushed` / `v6Flushed` 控制），否则缓存显示"已封"而 ipset 实际为空，这些 peer 永远拦不住。
 22. **启动读取 `ipset save` 必须走 `readIpsetSave()`，并保留 32MB `maxBuffer`**。host 网络模式下能看到宿主机的全部 ipset，Node 默认 1MB buffer 会让 aria2b 误进暂停状态。
 23. **新建 set 带 `maxelem MAX_BLOCKED_IPS`**，与本地缓存上限一致（ipset 默认 65536）。已存在的 set 不会重建，只有 `--flush` 才会用上新参数。
-24. **封禁时长不能超过 `MAX_TIMEOUT_SECONDS`（2147483，ipset 上限）**。`applyCliConfig` 在配置文件和 CLI 合并完之后夹到上限并警告；超出时 `ipset create` 会失败并误进暂停状态，`ipset add` 则每次都失败。
+24. **iptables / ipset 的失败要先归类再提示**（`classifyFirewallError`）：权限 → 提示 NET_ADMIN；nft 不支持且没装 legacy → 提示安装；内核缺 xt_set → 说明容器内无法修复。**必须先判断权限**：缺 NET_ADMIN 时 nft 后端同样报 `Could not fetch rule set generation id`，误判成 nft 会让用户去装已经没用的包。子进程错误经 `sanitizeError`（`summarizeCommandError`）压成一行，原始多行 stderr 只在 `DEV=1` 时输出。
+25. **封禁时长不能超过 `MAX_TIMEOUT_SECONDS`（2147483，ipset 上限）**。`applyCliConfig` 在配置文件和 CLI 合并完之后夹到上限并警告；超出时 `ipset create` 会失败并误进暂停状态，`ipset add` 则每次都失败。
 
 ### 配置 / CLI
 
-25. **`parseArgv` 不做类型转换**，值只会是字符串或 `true`。`--secret 001234` 必须保留前导 0；数字字段在 `applyCliConfig` 里通过 `applyPositiveIntegerConfig` 各自转换。
-26. **不带值的参数（值为 `true`）不能写进配置**：`parsePositiveInteger` 拒绝 boolean（`Number(true) === 1`）；字符串参数经 `cliString` 忽略并警告（否则 secret 会变成 `"true"`）；`-c` 不带路径按"路径为空"处理。
-27. **aria2.conf 的 `disable-ipv6` 只能关闭 IPv6**，不能覆盖 `detectIpv6Enabled()` 的结果去强制开启。`disable-ipv6=false` 是 aria2 的默认值。
-28. **显式 `-c` 指定的配置文件不可用时进入暂停状态**（`--flush` 时 exit 1），不回落到默认 RPC 配置继续运行。
-29. **寄生配置不支持行尾 `#` 注释**（`parseConfigLine` 只跳过整行注释），README 已说明。
+26. **`parseArgv` 不做类型转换**，值只会是字符串或 `true`。`--secret 001234` 必须保留前导 0；数字字段在 `applyCliConfig` 里通过 `applyPositiveIntegerConfig` 各自转换。
+27. **不带值的参数（值为 `true`）不能写进配置**：`parsePositiveInteger` 拒绝 boolean（`Number(true) === 1`）；字符串参数经 `cliString` 忽略并警告（否则 secret 会变成 `"true"`）；`-c` 不带路径按"路径为空"处理。
+28. **aria2.conf 的 `disable-ipv6` 只能关闭 IPv6**，不能覆盖 `detectIpv6Enabled()` 的结果去强制开启。`disable-ipv6=false` 是 aria2 的默认值。
+29. **显式 `-c` 指定的配置文件不可用时进入暂停状态**（`--flush` 时 exit 1），不回落到默认 RPC 配置继续运行。
+30. **寄生配置不支持行尾 `#` 注释**（`parseConfigLine` 只跳过整行注释），README 已说明。
 
 ## 测试约定
 
@@ -137,6 +139,7 @@ runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退�
 - [test/iptables.test.js](test/iptables.test.js)：ipset / iptables 初始化、后端探测与切换、IPv6 路径、暂停状态、`ipset save` buffer。
 - [test/config.test.js](test/config.test.js) / [test/parseargv.test.js](test/parseargv.test.js)：寄生配置、CLI 解析与合并。
 - [test/cli.test.js](test/cli.test.js)：以子进程运行 `-h` / `-v` / `--flush`。
+- [test/startup.test.js](test/startup.test.js)：用 shell 脚本冒充 iptables / ipset，按真实报错模拟内核不支持 nft、镜像缺 iptables-legacy、容器缺 NET_ADMIN，检查用户看到的完整启动日志。改启动提示时先改这里的断言。
 - [test/unit.test.js](test/unit.test.js)：纯函数与状态管理。
 - 修 bug 时补一条能复现原问题的回归测试。
 

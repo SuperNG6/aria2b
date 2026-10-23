@@ -13,7 +13,9 @@ const { _internal } = require('../app.js')
 const {
     config, blockedIps, runtime,
     iptablesBinaries,
-    looksLikeNftBackendIssue, pickIptablesBackendForVersion,
+    classifyFirewallError, describeBackendFailure, describeSetupFailure,
+    reportBackendSwitch, reportIpv6Unavailable,
+    pickIptablesBackendForVersion, sanitizeError,
     flushIptablesIpset, ensureIptablesRule, blockIp,
     runIdleMode, readIpsetSave,
     isBlocked,
@@ -289,27 +291,75 @@ test('blockIp: ipset add 失败不抛出，不污染本地缓存', async (t) => 
     assert.equal(blockedIps.has('2001:db8::ff'), false)
 })
 
-// ---------- looksLikeNftBackendIssue: 识别 nf_tables / xt_set 特征错误 ----------
+// ---------- 子进程错误摘要 / 归类：日志一行说清，提示对症 ----------
+// 以下 stderr 均为真实输出（群晖 DSM / Alpine 3.23 容器缺 NET_ADMIN）。
+const NFT_SYNOLOGY = 'Warning: Extension set revision 0 not supported, missing kernel module?\n' +
+    'iptables v1.8.11 (nf_tables): Could not fetch rule set generation id: Invalid argument\n'
+const NFT_NO_NET_ADMIN = 'iptables v1.8.11 (nf_tables): Could not fetch rule set generation id: Permission denied (you must be root)\n'
+const LEGACY_NO_NET_ADMIN = "iptables v1.8.11 (legacy): can't initialize iptables table `filter': Permission denied (you must be root)\n" +
+    'Perhaps iptables or your kernel needs to be upgraded.\n'
+const IP6_NO_SET_MATCH = "ip6tables v1.8.11 (legacy): Couldn't load match `set':No such file or directory\n\n" +
+    "Try `ip6tables -h' or 'ip6tables --help' for more information.\n"
 
-test('looksLikeNftBackendIssue: 命中 nf_tables / generation id / Extension set 等关键词', () => {
-    // 群晖 DSM 4.x 上 v2.1.x 实测错误
-    assert.equal(looksLikeNftBackendIssue({
-        stderr: 'Warning: Extension set revision 0 not supported, missing kernel module?\n' +
-                'iptables v1.8.11 (nf_tables): Could not fetch rule set generation id: Invalid argument\n'
-    }), true)
-    // 老版本 v1.x 在 ip6tables 上的不同报错形态
-    assert.equal(looksLikeNftBackendIssue({
-        stderr: "ip6tables v1.8.11 (nf_tables): Couldn't load match `set':No such file or directory"
-    }), true)
-    // message 字段也参与匹配
-    assert.equal(looksLikeNftBackendIssue({
-        message: 'iptables: missing kernel module'
-    }), true)
-    // 普通错误不命中（避免对无关失败误吼"切 legacy"）
-    assert.equal(looksLikeNftBackendIssue({ stderr: 'Permission denied' }), false)
-    assert.equal(looksLikeNftBackendIssue({ message: 'ENOENT' }), false)
-    assert.equal(looksLikeNftBackendIssue(null), false)
-    assert.equal(looksLikeNftBackendIssue(undefined), false)
+function execError(cmd, stderr) {
+    return Object.assign(new Error(`Command failed: ${cmd}\n${stderr}`), { cmd, stderr, code: 2 })
+}
+
+function enoent(bin) {
+    return Object.assign(new Error(`spawn ${bin} ENOENT`), { code: 'ENOENT', path: bin, cmd: `${bin} -L INPUT -n`, stderr: '' })
+}
+
+test('sanitizeError: 子进程错误压成一行，跳过 Warning / Perhaps / Try 附加行', () => {
+    assert.equal(sanitizeError(execError('iptables -L INPUT -n', NFT_SYNOLOGY)),
+        'iptables v1.8.11 (nf_tables): Could not fetch rule set generation id: Invalid argument')
+    assert.equal(sanitizeError(execError('iptables-legacy -L INPUT -n', LEGACY_NO_NET_ADMIN)),
+        "iptables v1.8.11 (legacy): can't initialize iptables table `filter': Permission denied (you must be root)")
+    assert.equal(sanitizeError(execError('ip6tables-legacy -I INPUT', IP6_NO_SET_MATCH)),
+        "ip6tables v1.8.11 (legacy): Couldn't load match `set':No such file or directory")
+    assert.equal(sanitizeError(enoent('iptables-legacy')), '找不到命令 iptables-legacy')
+    // 没有 stderr 时退回 message 第一行
+    assert.equal(sanitizeError(Object.assign(new Error('Command failed: ipset save\n'), { cmd: 'ipset save', stderr: '' })),
+        'Command failed: ipset save')
+})
+
+test('classifyFirewallError: 先判断权限，再区分 nft / xt_set / 缺命令', () => {
+    assert.equal(classifyFirewallError(execError('iptables', NFT_SYNOLOGY)), 'nft')
+    // 缺 NET_ADMIN 时 nft 后端同样报 generation id，必须归为权限问题，不能提示去装 iptables-legacy
+    assert.equal(classifyFirewallError(execError('iptables', NFT_NO_NET_ADMIN)), 'permission')
+    assert.equal(classifyFirewallError(execError('iptables-legacy', LEGACY_NO_NET_ADMIN)), 'permission')
+    assert.equal(classifyFirewallError(execError('ipset save', 'ipset v7.24: Kernel error received: Operation not permitted\n')), 'permission')
+    assert.equal(classifyFirewallError(execError('ip6tables-legacy', IP6_NO_SET_MATCH)), 'set-match')
+    assert.equal(classifyFirewallError(enoent('iptables-legacy')), 'missing')
+    assert.equal(classifyFirewallError(execError('ipset create', "ipset v7.24: Syntax error: '9' is out of range\n")), 'other')
+    assert.equal(classifyFirewallError(null), 'other')
+})
+
+test('describeBackendFailure: 只在确实缺包时建议安装 iptables-legacy', () => {
+    const noLegacy = describeBackendFailure('iptables', 'iptables-legacy',
+        execError('iptables', NFT_SYNOLOGY), enoent('iptables-legacy'))
+    assert.equal(noLegacy.installable, true)
+    assert.match(noLegacy.reason, /不支持默认 iptables 使用的 nft 后端，镜像里也没有 iptables-legacy/)
+    assert.match(noLegacy.fix, /apk add --no-cache iptables iptables-legacy ipset nodejs/)
+
+    const noNetAdmin = describeBackendFailure('iptables', 'iptables-legacy',
+        execError('iptables', NFT_NO_NET_ADMIN), execError('iptables-legacy', LEGACY_NO_NET_ADMIN))
+    assert.equal(noNetAdmin.installable, false)
+    assert.match(noNetAdmin.reason, /没有操作防火墙的权限/)
+    assert.match(noNetAdmin.fix, /NET_ADMIN/)
+    assert.doesNotMatch(noNetAdmin.fix, /iptables-legacy/)
+
+    const unknown = describeBackendFailure('ip6tables', 'ip6tables-legacy',
+        execError('ip6tables', 'boom\n'), execError('ip6tables-legacy', 'bang\n'))
+    assert.equal(unknown.installable, false)
+    assert.match(unknown.reason, /ip6tables：boom；ip6tables-legacy：bang/)
+})
+
+test('describeSetupFailure: 内核缺 xt_set 时说明容器内无法修复，不建议安装软件包', () => {
+    iptablesBinaries.v6 = 'ip6tables-legacy'
+    const r = describeSetupFailure(6, execError('ip6tables-legacy -I INPUT', IP6_NO_SET_MATCH))
+    assert.match(r.reason, /当前内核不支持 ip6tables-legacy 的 ipset 匹配/)
+    assert.doesNotMatch(r.fix, /apk add/)
+    assert.match(describeSetupFailure(4, execError('ipset create', 'ipset v7.24: Syntax error\n')).reason, /^ipset v7.24: Syntax error$/)
 })
 
 // ---------- pickIptablesBackendForVersion: 探测 + 自动切换 legacy ----------
@@ -323,7 +373,7 @@ test('pickIptablesBackendForVersion(4): 默认 iptables 探测通过 → 不切�
     }
     t.after(() => { runtime.execFile = original })
 
-    const ok = await pickIptablesBackendForVersion(4)
+    const { ok } = await pickIptablesBackendForVersion(4)
     assert.equal(ok, true)
     assert.equal(iptablesBinaries.v4, 'iptables', '默认能用就不切换')
     // 探测命令必须是 -L INPUT -n（不依赖 ipset / 额外模块的最小探针，且 -n 防 DNS 阻塞）
@@ -347,8 +397,11 @@ test('pickIptablesBackendForVersion(4): 默认 iptables 报 nft 错误 → 自�
     }
     t.after(() => { runtime.execFile = original })
 
-    const ok = await pickIptablesBackendForVersion(4)
-    assert.equal(ok, true)
+    const r = await pickIptablesBackendForVersion(4)
+    assert.equal(r.ok, true)
+    assert.equal(r.switched, true)
+    assert.equal(r.nftUnsupported, true)
+    assert.equal(r.bin, 'iptables-legacy')
     assert.equal(iptablesBinaries.v4, 'iptables-legacy', '默认坏 + legacy 好 → 切到 legacy')
     // 两次探测：默认 → legacy
     assert.equal(calls[0].file, 'iptables')
@@ -369,7 +422,7 @@ test('pickIptablesBackendForVersion(6): 默认坏 → 切到 ip6tables-legacy', 
     }
     t.after(() => { runtime.execFile = original })
 
-    const ok = await pickIptablesBackendForVersion(6)
+    const { ok } = await pickIptablesBackendForVersion(6)
     assert.equal(ok, true)
     assert.equal(iptablesBinaries.v6, 'ip6tables-legacy')
     // 关键：v6 探测不能误污染 v4（两个版本独立选）
@@ -383,8 +436,8 @@ test('pickIptablesBackendForVersion(4): 默认与 legacy 都报错 → 返回 fa
     }
     t.after(() => { runtime.execFile = original })
 
-    const ok = await pickIptablesBackendForVersion(4)
-    assert.equal(ok, false, '都不可用必须返回 false 让上层退出')
+    const { ok } = await pickIptablesBackendForVersion(4)
+    assert.equal(ok, false, '都不可用必须返回 ok=false 让上层进暂停状态')
     // 不应抛错（这是与"返回 false"的语义边界 —— 让 initial() 决定致命/降级）
 })
 
@@ -395,8 +448,49 @@ test('pickIptablesBackendForVersion(6): 都不可用返回 false（IPv6 软降�
     }
     t.after(() => { runtime.execFile = original })
 
-    const ok = await pickIptablesBackendForVersion(6)
+    const { ok } = await pickIptablesBackendForVersion(6)
     assert.equal(ok, false, '上层会据此 config.ipv6=false 软降级')
+})
+
+// ---------- 后端切换 / IPv6 未启用：能正常运行的情况只打普通提示 ----------
+
+function captureConsole(fn) {
+    const out = { log: [], warn: [], error: [] }
+    const original = { log: console.log, warn: console.warn, error: console.error }
+    for (const k of Object.keys(out)) console[k] = (...a) => out[k].push(a.join(' '))
+    try { fn() } finally { Object.assign(console, original) }
+    return out
+}
+
+test('reportBackendSwitch: 内核不支持 nft → 一行普通提示列出切换到的后端，不打警告', () => {
+    const v4 = { ok: true, switched: true, nftUnsupported: true, bin: 'iptables-legacy' }
+    const v6 = { ok: true, switched: true, nftUnsupported: true, bin: 'ip6tables-legacy' }
+    const out = captureConsole(() => reportBackendSwitch([v4, v6]))
+    assert.deepEqual(out.log, ['[aria2b] 检测到当前内核不支持 nft 防火墙后端，已切换到 iptables-legacy / ip6tables-legacy'])
+    assert.deepEqual(out.warn, [])
+    assert.deepEqual(out.error, [])
+
+    // 没有切换（默认后端可用）或 IPv6 未探测时不打任何日志
+    const quiet = captureConsole(() => reportBackendSwitch([{ ok: true, switched: false, bin: 'iptables' }, null]))
+    assert.deepEqual(quiet.log, [])
+
+    // 非 nft 原因的切换：说明默认后端的报错
+    const other = captureConsole(() => reportBackendSwitch([{ ok: true, switched: true, nftUnsupported: false,
+        bin: 'iptables-legacy', defaultBin: 'iptables', defaultError: '找不到命令 iptables' }]))
+    assert.deepEqual(other.log, ['[aria2b] 默认的 iptables 无法使用（找不到命令 iptables），已切换到 iptables-legacy'])
+})
+
+test('reportIpv6Unavailable: 内核不支持只打普通提示；确实缺包才警告并给修复方法', () => {
+    const kernel = captureConsole(() => reportIpv6Unavailable({
+        reason: '当前内核不支持 ip6tables-legacy 的 ipset 匹配（xt_set）', fix: '容器内无法修复', installable: false }))
+    assert.deepEqual(kernel.log, ['[aria2b] IPv6 封禁未启用：当前内核不支持 ip6tables-legacy 的 ipset 匹配（xt_set），仅启用 IPv4 封禁'])
+    assert.deepEqual(kernel.warn, [])
+
+    const missing = captureConsole(() => reportIpv6Unavailable({
+        reason: '镜像里没有 ip6tables-legacy', fix: '在 Dockerfile 增加 apk add 后重启容器', installable: true }))
+    assert.deepEqual(missing.log, [])
+    assert.equal(missing.warn.length, 1)
+    assert.match(missing.warn[0], /IPv6 封禁未启用（IPv4 不受影响）：镜像里没有 ip6tables-legacy。如需 IPv6 封禁，在 Dockerfile 增加 apk add 后重启容器。/)
 })
 
 // ---------- flushIptablesIpset 使用 iptablesBinaries 切换后的 binary ----------
