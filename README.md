@@ -2,8 +2,10 @@
 
 aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
-由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来
+由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来。本仓库是 [makeding/aria2b](https://github.com/makeding/aria2b) 的维护分支，v2.x 版本只在本仓库发布。
 
+> **v2.2.7**：secret 错误时日志直接提示与 aria2 的 rpc-secret 不一致（此前只显示 `HTTP 400 Bad Request`）；默认关键词 `BN` 等内置表以外的客户端代码现在能命中；封禁时长超过 ipset 上限（2147483 秒）时自动调整而不是无法封禁；IPv6 关闭时不再反复打出未生效的封禁日志；`disable-ipv6=false` 不再强制开启 IPv6；新建 ipset 的 `maxelem` 调到 200000；修正安装说明（npm 上的 `aria2b` 仍是上游 v1.0.9）。
+>
 > **v2.2.6**：修复 IPv6 字面量 RPC 地址无法连接；加速无进度 bitfield 检查，并跳过同轮已成功封禁的重复 IP，减少 CPU 开销、子进程和重复日志。
 >
 > **v2.2.5**：优化无进度上传检测的 bitfield 扫描路径，非监控客户端、上传速度不达标或已有进度的 peer 不再做完整 popcount，降低长期运行时的周期性 CPU 开销。
@@ -72,23 +74,27 @@ Alpine 3.23 中 `iptables` 包已提供 `ip6tables`，`iptables-legacy` 包已�
     yum install ipset
 
 ## 下载
-三选一
-### 稳定版（强烈推荐）
-> 同时也是更新命令
+> **_注意：_** npm 上的 `aria2b` 包由上游维护，停留在 v1.0.9，**不包含** v2.x 的任何修复，请不要再用 `npm i -g aria2b` 安装。
 
-    npm i -g aria2b
+### 单文件（推荐）
+> 适合 OpenWrt / Docker / 一般 Linux；同时也是更新命令
+
+自 v2.0.0 起发布物为单文件 bundle，不依赖 node_modules，只需要 Node.js：
+
+    curl -fL -o /usr/local/bin/aria2b https://github.com/SuperNG6/aria2b/releases/latest/download/aria2b
+    chmod +x /usr/local/bin/aria2b
     aria2b
-### 稳定版但是单文件
-> 适合 OpenWrt / Docker 单文件部署或者不想使用包管理器的你
 
-到 [releases](https://github.com/makeding/aria2b/releases) 下载最新版本（自 v2.0.0 起为单文件 bundle，不依赖 node_modules）
+也可以到 [releases](https://github.com/SuperNG6/aria2b/releases) 手动下载。v2.2.7 起附带的 `aria2b.sha256` 可以在下载目录直接用 `sha256sum -c aria2b.sha256` 校验。
 
-    chmod +x aria2b
-    ./aria2b
+### npm 全局安装
+每个 release 都附带 npm 包 `aria2b-X.Y.Z.tgz`，把 `X.Y.Z` 换成 [releases](https://github.com/SuperNG6/aria2b/releases) 里的最新版本号：
+
+    npm i -g https://github.com/SuperNG6/aria2b/releases/download/vX.Y.Z/aria2b-X.Y.Z.tgz
 
 ### 开发版
 
-    git clone https://github.com/makeding/aria2b.git # 克隆
+    git clone https://github.com/SuperNG6/aria2b.git # 克隆
     cd aria2b
     npm install        # 安装依赖
     node app.js
@@ -133,7 +139,7 @@ aria2b支持寄生配置。会读取aria2本体的配置文件来找 aria2 RPC �
 | 进度阈值 | --noprogress-piece| ab-bt-noprogress-piece | 5 | 单位：种子的分片数
 | 超过阈值等待次数 | --noprogress-wait | ab-bt-noprogress-wait | 10 |
 | 扫描间隔 | --scan-interval | ab-bt-scan-interval | 5000 | 单位毫秒，范围 1000~60000，超出会被夹到边界
-| IP 解除封禁时间 | --timeout | ab-bt-ban-timeout | 86400 | 单位秒，应 >> scan-interval（否则刚封就过期）
+| IP 解除封禁时间 | --timeout | ab-bt-ban-timeout | 86400 | 单位秒，应 >> scan-interval（否则刚封就过期）；最大 2147483（约 24.8 天，ipset 上限），超出会被调整到上限
 | 关闭证书校验 | --rpc-no-verify | ab-rpc-no-verify| N/A | rpc 为本地 https 时默认关闭证书校验
 | 自定义信任ca证书 | --rpc-ca | ab-rpc-ca | N/A | 路径/base64两次编码
 | 自定义信任证书 | --rpc-cert | ab-rpc-cert | N/A | 路径/base64两次编码

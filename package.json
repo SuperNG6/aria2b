@@ -1,6 +1,6 @@
 {
     "name": "aria2b",
-    "version": "2.2.6",
+    "version": "2.2.7",
     "license": "MIT",
     "engines": {
         "node": ">=22 <25"
@@ -17,7 +17,7 @@
         "lint": "eslint app.js test/ eslint.config.js"
     },
     "author": "huggy",
-    "repository": "https://github.com/makeding/aria2b",
+    "repository": "https://github.com/SuperNG6/aria2b",
     "devDependencies": {
         "esbuild": "^0.27.1",
         "eslint": "^9.39.4",

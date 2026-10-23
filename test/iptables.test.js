@@ -81,10 +81,11 @@ test('flushIptablesIpset(4): 使用 iptables + bt_blacklist，不带 family inet
         args: ['-D', 'INPUT', '-m', 'set', '--match-set', 'bt_blacklist', 'src', '-j', 'DROP']
     })
     assert.deepEqual(spy.calls[1], { file: 'ipset', args: ['destroy', 'bt_blacklist'] })
-    // 重建 set —— 必须是 hash:ip + timeout，且 v4 不能含 family inet6
+    // 重建 set —— 必须是 hash:ip + timeout，maxelem 与本地缓存上限一致（ipset 默认 65536），
+    // 且 v4 不能含 family inet6
     assert.deepEqual(spy.calls[2], {
         file: 'ipset',
-        args: ['create', 'bt_blacklist', 'hash:ip', 'timeout', '3600']
+        args: ['create', 'bt_blacklist', 'hash:ip', 'timeout', '3600', 'maxelem', '200000']
     })
     assert.ok(!spy.calls[2].args.includes('inet6'), 'IPv4 set 不应带 family inet6')
     // 装回 iptables 规则
@@ -111,7 +112,7 @@ test('flushIptablesIpset(6): 使用 ip6tables + bt_blacklist6 + family inet6', a
     // v6 必须带 family inet6，否则 ipset 默认建出来的是 inet（IPv4）set
     assert.deepEqual(spy.calls[2], {
         file: 'ipset',
-        args: ['create', 'bt_blacklist6', 'hash:ip', 'timeout', '7200', 'family', 'inet6']
+        args: ['create', 'bt_blacklist6', 'hash:ip', 'timeout', '7200', 'maxelem', '200000', 'family', 'inet6']
     })
     assert.deepEqual(spy.calls[3], {
         file: 'ip6tables',

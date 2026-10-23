@@ -1,3 +1,30 @@
+# v2.2.7
+
+## 修复
+
+- secret 错误时日志显示 aria2 返回的错误原因，并提示 secret 与 aria2 的 `rpc-secret` 不一致。aria2 用 HTTP 400 返回 RPC 错误，此前错误信息被丢弃，日志只有 `HTTP 400 Bad Request`。
+- 内置识别表以外的 Az 格式客户端代码（例如默认关键词里的 `BN`，以及 `-DL` 等）现在也能被关键词命中。此前它们没有 `origin` 字段，默认的 `BN` 和用户自己添加的表外代码都不会生效。客户端仍按未知客户端处理，`Unknown` 规则不变。
+- 封禁时长超过 ipset 上限 2147483 秒（约 24.8 天）时自动调整到上限并警告。此前全新环境会因 `ipset create` 失败进入暂停扫描状态（还给出了不相关的 iptables-legacy 提示），已有 set 时则每次封禁都失败。
+- IPv6 关闭（包括启动时自动降级）时跳过 IPv6 peer。此前无进度检测会反复打出"封禁疑似无进度上传"日志，但实际从未封禁。
+- `aria2.tellActive` 返回格式异常时按扫描失败处理，不再当作"没有活跃任务"清空无进度累计。
+- `--secret`、`-b`、`-u`、`--rpc-ca` 等字符串参数不带值时忽略并警告，不再写入字符串 `"true"`；`-c` 不带路径时提示路径为空。
+- aria2.conf 中的 `disable-ipv6=false`（aria2 默认值）不再覆盖系统探测结果强制开启 IPv6。此前在无 IPv6 的主机上会去探测 `ip6tables`，失败后降级并多打 3 行警告；现在 `disable-ipv6` 只用于关闭 IPv6。
+- 新建 `bt_blacklist` / `bt_blacklist6` 时显式设置 `maxelem 200000`，与本地缓存上限一致。ipset 默认上限 65536，封禁 IP 过多时会一直报"封禁失败"。已存在的 set 不会被重建，需要执行一次 `aria2b --flush` 才会用上新上限。
+
+## 文档
+
+- npm 上的 `aria2b` 包由上游维护，停留在 v1.0.9，不包含 v2.x 的任何修复。README 改为推荐从本仓库 release 下载单文件，或用 release 附带的 tgz 执行 `npm i -g`；仓库、下载、clone 链接改为 `SuperNG6/aria2b`。
+
+## 其他
+
+- release 附带的 `aria2b.sha256` 只记录文件名，下载后可直接 `sha256sum -c aria2b.sha256`（此前记录的是 `dist/aria2b`，校验会找不到文件）。
+- 移除生产代码中已不再使用的 `countOnes`。
+- 修正注释与测试：aria2 `system.multicall` 子调用失败返回 `{ code, message }`，不是 `{ faultCode, faultString }`。
+
+## 测试
+
+- 128/128 通过。真实 aria2c 1.37.0 + ipset/iptables 环境验证：错误 secret 的日志、超大封禁时长的启动与建表、`BN` 关键词命中、IPv6 关闭时不再打出无效封禁日志。
+
 # v2.2.6
 
 ## 修复

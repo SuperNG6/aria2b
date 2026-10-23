@@ -25,7 +25,8 @@ function startMockAria2(handler) {
                 try {
                     const json = JSON.parse(body)
                     const reply = handler(json)
-                    res.writeHead(200, { 'Content-Type': 'application/json' })
+                    // 与真实 aria2 一致：RPC 错误用 HTTP 400 返回
+                    res.writeHead(reply.error ? 400 : 200, { 'Content-Type': 'application/json' })
                     res.end(JSON.stringify({ jsonrpc: '2.0', id: json.id, ...reply }))
                 } catch (e) {
                     res.writeHead(500)
@@ -328,9 +329,10 @@ test('cron: system.multicall 子调用 fault 时不清 peerState', async (t) => 
         if (req.method === 'aria2.tellActive') return { result: [{ gid: 'gid-1' }] }
         if (req.method === 'system.multicall') {
             if (mode === 'child-fault') {
+                // aria2 实测的子调用失败格式
                 return { result: [
-                    { faultCode: 1, faultString: 'gid disappeared' },
-                    { faultCode: 1, faultString: 'gid disappeared' }
+                    { code: 1, message: 'gid disappeared' },
+                    { code: 1, message: 'gid disappeared' }
                 ] }
             }
             if (mode === 'malformed-peers') {
@@ -574,12 +576,78 @@ test('cron: RPC 业务错误（如 secret 错误）→ 重试计数 +1 但不崩
     const spy = spyExecFile()
     t.after(() => spy.restore())
 
-    await cron()
+    const logs = []
+    const originalError = console.error
+    console.error = (...a) => logs.push(a.join(' '))
+    try {
+        await cron()
+    } finally {
+        console.error = originalError
+    }
     assert.equal(_internal._getFailures(), 1)
+    // aria2 把错误放在 HTTP 400 的响应体里；日志必须给出 aria2 的错误原因，不能只有 "HTTP 400"
+    assert.equal(logs.length, 1)
+    assert.match(logs[0], /aria2 RPC aria2\.tellActive 错误：Unauthorized/)
+    assert.match(logs[0], /rpc-secret/)
+    assert.doesNotMatch(logs[0], /wrong/, '日志不能包含 secret')
     await cron()
     assert.equal(_internal._getFailures(), 2)
     // 不应有 ipset 调用
     assert.equal(spy.calls.length, 0)
+})
+
+test('cron: tellActive 结果不是数组 → 算失败，不清 peerState', async (t) => {
+    _reset()
+    let mode = 'ok'
+    const mock = await startMockAria2((req) => {
+        if (req.method === 'aria2.tellActive') return { result: mode === 'ok' ? [] : null }
+        return { result: [] }
+    })
+    t.after(() => mock.close())
+
+    config.rpc_url = mock.url
+    _setRpcClient(_makeRpcClient())
+    const spy = spyExecFile()
+    t.after(() => spy.restore())
+    const originalError = console.error
+    console.error = () => {}
+    t.after(() => { console.error = originalError })
+
+    peerState.set('stale-peer-key', { uploaded: 1, wait: 3 })
+    mode = 'null'
+    await cron()
+    assert.equal(_internal._getFailures(), 1, '异常响应不能当成"无活跃任务"')
+    assert.equal(peerState.size, 1, '异常响应不能清空无进度累计')
+
+    mode = 'ok'
+    await cron()
+    assert.equal(_internal._getFailures(), 0)
+    assert.equal(peerState.size, 0, '真正没有活跃任务时才清理')
+})
+
+test('cron: 默认关键词能封内置表以外的 Az 格式代码（BN）', async (t) => {
+    _reset()
+    const mock = await startMockAria2((req) => {
+        if (req.method === 'aria2.tellActive') return { result: [{ gid: 'g' }] }
+        if (req.method === 'system.multicall') {
+            return { result: req.params[0].map(c => c.methodName === 'aria2.tellStatus'
+                ? [{ numPieces: 100, pieceLength: 16384 }]
+                : [[{ peerId: '%2DBN0001%2Dabcdef012345', ip: '203.0.113.80',
+                    uploadSpeed: 0, downloadSpeed: 0, bitfield: 'ff' }]]) }
+        }
+        return { result: [] }
+    })
+    t.after(() => mock.close())
+
+    config.rpc_url = mock.url
+    _setRpcClient(_makeRpcClient())
+    const spy = spyExecFile()
+    t.after(() => spy.restore())
+
+    await cron()
+    const adds = spy.calls.filter(c => c.file === 'ipset' && c.args[0] === 'add')
+    assert.equal(adds.length, 1, '默认 block_keywords 含 BN，必须命中')
+    assert.equal(adds[0].args[3], '203.0.113.80')
 })
 
 // ---------- cron: 没有活跃任务 → 不调 multicall ----------

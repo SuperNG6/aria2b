@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * aria2b — 自动封禁 aria2 中吸血/不受欢迎的 BT 客户端
- * https://github.com/makeding/aria2b
+ * https://github.com/SuperNG6/aria2b
  *
  * 通过 aria2 JSON-RPC 周期性检查 peer，命中策略后调用 ipset/iptables 拉黑 IP。
  * 设计目标：Docker（Alpine + s6 + aria2c）中长期稳定运行，无需人工看日志。
@@ -34,9 +34,10 @@ const RPC_HTTP_TIMEOUT = 30000
 const RPC_MAX_BODY_BYTES = 64 * 1024 * 1024
 const IPSET_SAVE_MAX_BUFFER_BYTES = 32 * 1024 * 1024
 const MAX_BACKOFF_DELAY = 60000
-const MAX_BLOCKED_IPS = 200000   // ipset hash:ip 默认 65536，本地缓存放宽一些
+const MAX_BLOCKED_IPS = 200000   // 本地缓存上限，同时作为新建 ipset 的 maxelem（默认 65536 太小）
 const MAX_PEER_STATE = 50000     // peer 状态机容量上限（防意外膨胀）
 const DEFAULT_TIMEOUT_SECONDS = 86400
+const MAX_TIMEOUT_SECONDS = 2147483   // ipset timeout 上限（约 24.8 天），超出时 create/add 直接报语法错误
 const PEER_MIN_UPLOAD_BYTES_PER_SEC = 1024
 const IPSET_NAME_V4 = 'bt_blacklist'
 const IPSET_NAME_V6 = 'bt_blacklist6'
@@ -798,24 +799,19 @@ function unknownPeerClient() {
 }
 
 function detectPeerClient(peerId) {
+    let c
     try {
-        return getPeerName(peerId) || unknownPeerClient()
+        c = getPeerName(peerId) || unknownPeerClient()
     } catch (e) {
         honsole.dev('peerId 识别失败，按 unknown 处理:', sanitizeError(e))
         return unknownPeerClient()
     }
-}
-
-function countOnes(hexString) {
-    if (!hexString || typeof hexString !== 'string') return 0
-    let count = 0
-    for (let i = 0; i < hexString.length; i++) {
-        const n = parseInt(hexString[i], 16)
-        if (Number.isNaN(n)) continue
-        let v = n
-        while (v) { v &= v - 1; count++ }
+    // 内置表只给已知代码填 origin；表外的 Az 格式（如 `-BN0001-`）也要能被关键词命中，
+    // 否则默认关键词 BN 和用户自加的表外代码永远不生效。client 仍是 'unknown'，Unknown 规则不受影响。
+    if (c.client === 'unknown' && !c.origin && typeof peerId === 'string' && peerIdUtils.isAzStyle(peerId)) {
+        c = { ...c, origin: peerId.substring(1, 3) }
     }
-    return count
+    return c
 }
 
 function hasProgressBit(hexString) {
@@ -1001,7 +997,8 @@ function cleanupBlockedIps() {
  * `{ data, status, statusText }`。失败时抛出的 error 形态与 sanitizeError
  * 的兼容契约：
  *   - 连接层错误透传原生 e.code / e.address / e.port（ECONNREFUSED 等）
- *   - HTTP 状态码 >= 400 时抛带 `e.response = { status, statusText }` 的错误
+ *   - HTTP 状态码 >= 300 时抛带 `e.response = { status, statusText }` 的错误；
+ *     响应体是合法 JSON 时附在 `e.response.data`（aria2 的 RPC 错误用 HTTP 400 返回）
  *   - 超时抛 `{ code: 'ECONNABORTED' }`，与 axios 风格对齐
  *   - 响应体超过 RPC_MAX_BODY_BYTES 时抛 `EMSGSIZE`，并主动 abort 连接
  *
@@ -1065,6 +1062,7 @@ function httpJsonPost(opts, url, body) {
                 if (status >= 300) {
                     const err = new Error(`HTTP ${status} ${statusText}`.trim())
                     err.response = { status, statusText }
+                    try { if (text) err.response.data = JSON.parse(text) } catch (_) { /* 非 JSON 错误页 */ }
                     return reject(err)
                 }
                 let data
@@ -1128,6 +1126,30 @@ function rpcId() {
     return `aria2b-${_rpcIdCounter}`
 }
 
+function aria2RpcError(method, rpcError) {
+    const msg = (rpcError && rpcError.message) || 'unknown'
+    const hint = msg === 'Unauthorized' ? '（secret 与 aria2 的 rpc-secret 不一致）' : ''
+    const err = new Error(`aria2 RPC ${method} 错误：${msg}${hint}`)
+    err.rpcError = rpcError
+    return err
+}
+
+// aria2 把 RPC 错误（例如 secret 不对）放在 HTTP 400 的 JSON 响应体里返回；
+// 这里把它还原成 aria2 的错误信息，否则日志只剩 "HTTP 400 Bad Request"，用户无从排查。
+async function rpcPost(method, body) {
+    let res
+    try {
+        res = await rpcClient.post(config.rpc_url, body)
+    } catch (e) {
+        const rpcError = e.response && e.response.data && e.response.data.error
+        if (rpcError) throw aria2RpcError(method, rpcError)
+        throw e
+    }
+    const data = res.data
+    if (data && data.error) throw aria2RpcError(method, data.error)
+    return data
+}
+
 async function rpcCall(method, params = []) {
     const body = {
         jsonrpc: '2.0',
@@ -1135,13 +1157,7 @@ async function rpcCall(method, params = []) {
         method,
         params: [`token:${config.secret}`, ...params]
     }
-    const { data } = await rpcClient.post(config.rpc_url, body)
-    if (data && data.error) {
-        const msg = data.error.message || 'unknown'
-        const err = new Error(`aria2 RPC ${method} 错误：${msg}`)
-        err.rpcError = data.error
-        throw err
-    }
+    const data = await rpcPost(method, body)
     return data ? data.result : undefined
 }
 
@@ -1157,10 +1173,7 @@ async function rpcMulticall(calls) {
         method: 'system.multicall',
         params: [wrapped]
     }
-    const { data } = await rpcClient.post(config.rpc_url, body)
-    if (data && data.error) {
-        throw new Error(`aria2 system.multicall 错误：${data.error.message || 'unknown'}`)
-    }
+    const data = await rpcPost('system.multicall', body)
     return (data && Array.isArray(data.result)) ? data.result : []
 }
 
@@ -1266,7 +1279,7 @@ async function flushIptablesIpset(version) {
         await runtime.execFile(iptables, ['-D', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP']).catch(() => {})
         await runtime.execFile('ipset', ['destroy', setName]).catch(() => {})
 
-        const createArgs = ['create', setName, 'hash:ip', 'timeout', String(config.timeout)]
+        const createArgs = ['create', setName, 'hash:ip', 'timeout', String(config.timeout), 'maxelem', String(MAX_BLOCKED_IPS)]
         if (version === 6) createArgs.push('family', 'inet6')
         await runtime.execFile('ipset', createArgs)
         await runtime.execFile(iptables, ['-I', 'INPUT', '-m', 'set', '--match-set', setName, 'src', '-j', 'DROP'])
@@ -1423,6 +1436,9 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
     activeKeys.add(stateKey)
 
     if (isBlocked(peer.ip)) return
+    // IPv6 关闭（含启动时软降级）时 blockIp 不会封 IPv6，这里直接跳过：
+    // 否则无进度检测会反复打出"封禁疑似无进度上传"日志却从未真正封禁。
+    if (!config.ipv6 && net.isIP(peer.ip) === 6) return
 
     const decoded = decodePercentEncodedString(peer.peerId)
     const c = detectPeerClient(decoded)
@@ -1491,7 +1507,10 @@ async function cron() {
     try {
         // 1) 拿活跃任务 gid 列表
         const active = await rpcCall('aria2.tellActive', [['gid']])
-        const gids = Array.isArray(active) ? active.map(t => t && t.gid).filter(Boolean) : []
+        // 结果不是数组（空响应体 / 异常响应）必须当失败处理：当成"无活跃任务"会把
+        // 本轮视为完全成功，cleanupPeerState 清空所有无进度累计。
+        if (!Array.isArray(active)) throw new Error('aria2.tellActive 返回格式异常')
+        const gids = active.map(t => t && t.gid).filter(Boolean)
 
         // 2) 一次 multicall 把所有 tellStatus + getPeers 拿回
         //    旧版每个 torrent 单独跑 2 个 multicall（且只塞一条调用），完全没用上批量
@@ -1509,7 +1528,7 @@ async function cron() {
         // 3) 解析处理
         for (let i = 0; i < gids.length; i++) {
             const gid = gids[i]
-            // multicall 子调用：成功返回 [result]，失败返回 { faultCode, faultString }
+            // multicall 子调用：成功返回 [result]，失败返回 { code, message }（aria2 实测格式）
             const statusRes = results[i * 2]
             const peersRes  = results[i * 2 + 1]
             if (!Array.isArray(statusRes) || !Array.isArray(peersRes)) {
@@ -1613,7 +1632,7 @@ function loadConfigFromAria2File(path) {
             case 'rpc-secret':                  config.secret = value; break
             case 'rpc-listen-port':             { const n = parsePositiveInteger(value, null); if (n) port = n; break }
             case 'rpc-secure':                  ssl = parseBoolean(value, false); break
-            case 'disable-ipv6':                config.ipv6 = !parseBoolean(value, false); break
+            case 'disable-ipv6':                if (parseBoolean(value, false)) config.ipv6 = false; break
             case 'ab-bt-ban-client-keywords':   config.block_keywords = parseList(value); break
             case 'ab-bt-noprogress-keywords':   config.noprogress_keywords = parseList(value); break
             case 'ab-bt-noprogress-piece':      applyPositiveIntegerConfig('noprogress_piece', value); break
@@ -1697,19 +1716,32 @@ function parseArgv(args) {
     return out
 }
 
+// 字符串参数不带值时 parseArgv 给的是 true；不能把它当成字符串 "true" 写进 secret / 关键词。
+function cliString(name) {
+    const value = argv[name]
+    if (value !== true) return value
+    honsole.warn(`--${name} 缺少参数值，已忽略`)
+    return undefined
+}
+
 function applyCliConfig() {
     const v = argv
-    if (v.url || v['rpc-url']) config.rpc_url = v.url || v['rpc-url']
-    if (v.secret !== undefined) config.secret = String(v.secret)
-    if (v['block-keywords']) config.block_keywords = parseList(v['block-keywords'])
-    if (v['noprogress-keywords']) config.noprogress_keywords = parseList(v['noprogress-keywords'])
+    const url = cliString('url') || cliString('rpc-url')
+    if (url) config.rpc_url = url
+    const secret = cliString('secret')
+    if (secret !== undefined) config.secret = String(secret)
+    const blockKeywords = cliString('block-keywords')
+    if (blockKeywords) config.block_keywords = parseList(blockKeywords)
+    const noprogressKeywords = cliString('noprogress-keywords')
+    if (noprogressKeywords) config.noprogress_keywords = parseList(noprogressKeywords)
     if (v['noprogress-piece'] !== undefined) applyPositiveIntegerConfig('noprogress_piece', v['noprogress-piece'])
     if (v['noprogress-wait']  !== undefined) applyPositiveIntegerConfig('noprogress_wait',  v['noprogress-wait'])
     if (v.timeout !== undefined) applyPositiveIntegerConfig('timeout', v.timeout)
     if (v['scan-interval'] !== undefined) applyPositiveIntegerConfig('scan_interval', v['scan-interval'])
-    if (v['rpc-ca'])   config.rpc_options.ca   = v['rpc-ca']
-    if (v['rpc-cert']) config.rpc_options.cert = v['rpc-cert']
-    if (v['rpc-key'])  config.rpc_options.key  = v['rpc-key']
+    for (const x of ['ca', 'cert', 'key']) {
+        const value = cliString(`rpc-${x}`)
+        if (value) config.rpc_options[x] = value
+    }
     if (v['rpc-no-verify'] !== undefined) applyNoVerify(v['rpc-no-verify'])
 
     for (const x of ['ca', 'cert', 'key']) {
@@ -1724,6 +1756,11 @@ function applyCliConfig() {
     }
 
     config.scan_interval = Math.max(MIN_SCAN_INTERVAL, Math.min(MAX_SCAN_INTERVAL, config.scan_interval))
+    // 配置文件和 CLI 都合并完再夹：超过 ipset 上限时 create 失败会误进暂停状态，add 失败则一个 IP 都封不上。
+    if (config.timeout > MAX_TIMEOUT_SECONDS) {
+        honsole.warn(`封禁时长 ${config.timeout}s 超过 ipset 上限，已调整为 ${MAX_TIMEOUT_SECONDS}s（约 24.8 天）`)
+        config.timeout = MAX_TIMEOUT_SECONDS
+    }
 }
 
 function helpText() {
@@ -1737,7 +1774,7 @@ function helpText() {
 ${name} -c, --config <aria2 config path>
 ${pad}-u, --url <rpc url> (default: http://127.0.0.1:6800/jsonrpc)
 ${pad}-s, --secret <secret>
-${pad}--timeout <seconds> (default: 86400)
+${pad}--timeout <seconds> (default: 86400, max: ${MAX_TIMEOUT_SECONDS})
 ${pad}--scan-interval <ms> (default: 5000, range: 1000-60000)
 ${pad}--block-keywords <string>
 ${pad}--noprogress-keywords <string>
@@ -1756,7 +1793,7 @@ Env:
   DEV=1               输出 debug 日志
   HIDE_TIME_PREFIX=1  日志不带时间前缀（方便外部加时间）
 
-https://github.com/makeding/aria2b`
+https://github.com/SuperNG6/aria2b`
 }
 
 // ============================================================================
@@ -1817,7 +1854,7 @@ async function initial() {
     config.ipv6 = detectIpv6Enabled()
 
     const explicitConfigPath = argv.config !== undefined
-    const cfgPath = explicitConfigPath ? String(argv.config) : findAria2Config()
+    const cfgPath = explicitConfigPath ? (argv.config === true ? '' : String(argv.config)) : findAria2Config()
     if (cfgPath) {
         const loaded = loadConfigFromAria2File(cfgPath)
         if (!loaded && explicitConfigPath) {
@@ -1932,8 +1969,7 @@ module.exports = {
         config, blockedIps, peerState, runtime,
         defaultConfig,
         // helpers
-        decodePercentEncodedString, decodeClient, countOnes,
-        hasProgressBit,
+        decodePercentEncodedString, decodeClient, hasProgressBit,
         getPeerName, detectPeerClient,
         formatLocalTimestamp,
         parseList, parsePositiveInteger, parseBoolean,

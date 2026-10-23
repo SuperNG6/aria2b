@@ -33,6 +33,13 @@ test('app.js --help / --version 别名同样可用', () => {
     assert.equal(run(['--version']).status, 0)
 })
 
+test('app.js --flush -c 不带路径: 按"路径为空"处理，不去读名为 true 的文件', () => {
+    const r = run(['--flush', '-c'])
+    assert.equal(r.status, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`)
+    assert.match(r.stderr, /显式指定的配置文件路径为空/)
+    assert.doesNotMatch(r.stderr, /\(true\)/)
+})
+
 test('app.js --flush -c 指向不存在文件: 退出码非 0 且不继续默认启动', () => {
     const missing = path.join(__dirname, '__definitely_missing_aria2.conf')
     const r = run(['--flush', '-c', missing])

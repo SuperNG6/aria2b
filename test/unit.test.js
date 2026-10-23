@@ -5,8 +5,8 @@ const assert = require('node:assert/strict')
 const { _internal } = require('../app.js')
 
 const {
-    decodePercentEncodedString, decodeClient, countOnes, hasProgressBit,
-    getPeerName, detectPeerClient,
+    decodePercentEncodedString, decodeClient, hasProgressBit,
+    getPeerName, detectPeerClient, processOnePeer,
     formatLocalTimestamp,
     parseList, parsePositiveInteger, parseBoolean,
     hasUnknownKeyword, keywordMatches,
@@ -88,22 +88,7 @@ test('decodeClient: 只解码可打印 ASCII', () => {
     assert.equal(decodeClient(null), '')
 })
 
-// ---------- countOnes ----------
-test('countOnes: 数 bitfield 的 1 个数（per-nibble popcount）', () => {
-    assert.equal(countOnes(''), 0)
-    assert.equal(countOnes(null), 0)
-    assert.equal(countOnes('0'), 0)
-    assert.equal(countOnes('f'), 4)
-    assert.equal(countOnes('ff'), 8)
-    assert.equal(countOnes('ffff'), 16)
-    assert.equal(countOnes('FFFF'), 16)
-    assert.equal(countOnes('80'), 1)
-    assert.equal(countOnes('0a'), 2)
-    // 巨长 hex（旧版 BigInt 在某些场景下会出问题）
-    const longHex = 'ff'.repeat(1000)
-    assert.equal(countOnes(longHex), 8000)
-})
-
+// ---------- hasProgressBit ----------
 test('hasProgressBit: 快速判断 bitfield 是否存在任意进度', () => {
     assert.equal(hasProgressBit(''), false)
     assert.equal(hasProgressBit(null), false)
@@ -111,7 +96,7 @@ test('hasProgressBit: 快速判断 bitfield 是否存在任意进度', () => {
     assert.equal(hasProgressBit('0001'), true)
     assert.equal(hasProgressBit('8000'), true)
     assert.equal(hasProgressBit('000F'), true)
-    // 与 countOnes 一致：非法 hex nibble 忽略，不把它当进度。
+    // 非法 hex nibble 忽略，不把它当进度。
     assert.equal(hasProgressBit('ZZZ'), false)
     assert.equal(hasProgressBit('00Z10'), true)
 })
@@ -156,6 +141,49 @@ test('getPeerName: 内置 peerId 识别保留 @huggycn/bittorrent-peerid 行为'
 test('detectPeerClient: 识别异常时降级为 unknown，避免扫描循环中断', () => {
     assert.deepEqual(detectPeerClient('-XL0012-123456789012'), getPeerName('-XL0012-123456789012'))
     assert.deepEqual(detectPeerClient(null), { client: 'unknown', origin: '', version: '' })
+})
+
+test('detectPeerClient: 内置表以外的 Az 格式代码也给 origin，client 仍为 unknown', () => {
+    // 默认关键词 BN 不在内置表里，旧版没有 origin，关键词永远匹配不上
+    assert.deepEqual(detectPeerClient('-BN0001-123456789012'), { client: 'unknown', origin: 'BN' })
+    assert.deepEqual(detectPeerClient('-DL1234-123456789012'), { client: 'unknown', origin: 'DL' })
+    assert.equal(keywordMatches(config.block_keywords, detectPeerClient('-BN0001-123456789012').origin), true)
+    // 非 Az 格式保持无 origin
+    assert.deepEqual(detectPeerClient('short'), { client: 'unknown' })
+})
+
+test('processOnePeer: IPv6 关闭时跳过 IPv6 peer，不建状态、不入封禁队列、不打封禁日志', () => {
+    config.ipv6 = false
+    config.block_keywords = ['NONE']
+    config.noprogress_piece = 1
+    config.noprogress_wait = 1
+    const peer = { peerId: '%2DXL0012%2Dabcdef012345', ip: '2001:db8::5',
+        uploadSpeed: 100000, downloadSpeed: 0, bitfield: '00' }
+    const logs = []
+    const originalLog = console.log
+    console.log = (...a) => logs.push(a.join(' '))
+    try {
+        for (let n = 0; n < 5; n++) {
+            const queue = []
+            processOnePeer(peer, 'g', { pieceLength: 16384, numPieces: 10 }, new Set(), queue)
+            assert.equal(queue.length, 0)
+        }
+    } finally {
+        console.log = originalLog
+    }
+    assert.equal(peerState.size, 0)
+    assert.deepEqual(logs, [])
+
+    // IPv6 启用时同一 peer 正常进入封禁队列
+    config.ipv6 = true
+    let queue = []
+    for (let n = 0; n < 5 && queue.length === 0; n++) {
+        queue = []
+        console.log = () => {}
+        try { processOnePeer(peer, 'g', { pieceLength: 16384, numPieces: 10 }, new Set(), queue) }
+        finally { console.log = originalLog }
+    }
+    assert.deepEqual(queue.map(x => x.ip), ['2001:db8::5'])
 })
 
 // ---------- hasUnknownKeyword / keywordMatches ----------

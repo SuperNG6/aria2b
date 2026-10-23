@@ -141,6 +141,38 @@ test('makeRpcClient: HTTP 4xx → 抛带 e.response.{status, statusText} 的错�
     )
 })
 
+test('makeRpcClient: 4xx 的 JSON 响应体附在 e.response.data（aria2 的 RPC 错误用 HTTP 400 返回）', async (t) => {
+    const mock = await startServer((req, res) => {
+        res.writeHead(400, 'Bad Request', { 'Content-Type': 'application/json' })
+        res.end('{"id":1,"jsonrpc":"2.0","error":{"code":1,"message":"Unauthorized"}}')
+    })
+    t.after(() => mock.close())
+    const client = _makeRpcClient()
+    t.after(() => client.destroy())
+
+    await assert.rejects(() => client.post(mock.url, {}), (e) => {
+        assert.equal(e.response.status, 400)
+        assert.deepEqual(e.response.data.error, { code: 1, message: 'Unauthorized' })
+        return true
+    })
+})
+
+test('makeRpcClient: 4xx 响应体不是 JSON 时照常抛错，不附 data', async (t) => {
+    const mock = await startServer((req, res) => {
+        res.writeHead(404, 'Not Found')
+        res.end('<html>404</html>')
+    })
+    t.after(() => mock.close())
+    const client = _makeRpcClient()
+    t.after(() => client.destroy())
+
+    await assert.rejects(() => client.post(mock.url, {}), (e) => {
+        assert.equal(e.response.status, 404)
+        assert.equal(e.response.data, undefined)
+        return true
+    })
+})
+
 test('makeRpcClient: HTTP 500 同样抛 e.response.status', async (t) => {
     const mock = await startServer((req, res) => {
         res.writeHead(500)

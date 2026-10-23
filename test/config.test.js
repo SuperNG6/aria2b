@@ -115,6 +115,67 @@ test('applyCliConfig: TLS 物料 forEach 必然执行（不再被 ASI 吞掉）'
     )
 })
 
+test('applyCliConfig: timeout 超过 ipset 上限 2147483 时夹到上限（CLI 与配置文件）', () => {
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+        _reset()
+        _setArgv(parseArgv(['--timeout', '2592000']))
+        applyCliConfig()
+        assert.equal(config.timeout, 2147483)
+
+        _reset()
+        _setArgv(parseArgv(['--timeout', '2147483']))
+        applyCliConfig()
+        assert.equal(config.timeout, 2147483, '恰好等于上限时不改')
+
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aria2b-test-'))
+        try {
+            const cfgPath = path.join(tmpDir, 'aria2.conf')
+            fs.writeFileSync(cfgPath, 'ab-bt-ban-timeout=99999999\n')
+            _reset()
+            _setArgv(parseArgv([]))
+            loadConfigFromAria2File(cfgPath)
+            applyCliConfig()
+            assert.equal(config.timeout, 2147483)
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true })
+        }
+    } finally {
+        console.warn = originalWarn
+    }
+})
+
+test('applyCliConfig: 字符串参数缺值时忽略并警告，不写入 "true"', () => {
+    const warnings = []
+    const originalWarn = console.warn
+    console.warn = (...a) => warnings.push(a.join(' '))
+    try {
+        _reset()
+        config.secret = 'from-conf'
+        _setArgv(parseArgv(['--secret', '-b', '--noprogress-keywords', '-u', '--rpc-ca']))
+        applyCliConfig()
+    } finally {
+        console.warn = originalWarn
+    }
+    assert.equal(config.secret, 'from-conf')
+    assert.deepEqual(config.block_keywords, ['XL', 'SD', 'XF', 'QD', 'BN'])
+    assert.deepEqual(config.noprogress_keywords, ['XL', 'SD', 'XF', 'QD', 'BN', 'Unknown'])
+    assert.equal(config.rpc_url, 'http://127.0.0.1:6800/jsonrpc')
+    assert.equal(config.rpc_options.ca, undefined)
+    for (const name of ['secret', 'block-keywords', 'noprogress-keywords', 'url', 'rpc-ca']) {
+        assert.ok(warnings.some(w => w.includes(`--${name} 缺少参数值`)), `应警告 --${name}`)
+    }
+})
+
+test('applyCliConfig: --secret= 显式空值仍然生效', () => {
+    _reset()
+    config.secret = 'from-conf'
+    _setArgv(parseArgv(['--secret=']))
+    applyCliConfig()
+    assert.equal(config.secret, '')
+})
+
 test('applyCliConfig: scan-interval 限幅 [1000, 60000]', () => {
     _reset()
     _setArgv(parseArgv(['--scan-interval', '100']))
@@ -137,7 +198,6 @@ test('loadConfigFromAria2File: 寄生读取 aria2 conf', () => {
         'rpc-secret=hello-secret',
         'rpc-listen-port=16800',
         'rpc-secure=true',
-        'disable-ipv6=false',
         'ab-bt-ban-client-keywords=XL,SD,XF',
         'ab-bt-noprogress-keywords=XL,Unknown',
         'ab-bt-noprogress-piece=8',
@@ -155,7 +215,6 @@ test('loadConfigFromAria2File: 寄生读取 aria2 conf', () => {
         assert.equal(ok, true)
         assert.equal(config.secret, 'hello-secret')
         assert.equal(config.rpc_url, 'https://127.0.0.1:16800/jsonrpc')
-        assert.equal(config.ipv6, true)
         assert.deepEqual(config.block_keywords, ['XL', 'SD', 'XF'])
         assert.deepEqual(config.noprogress_keywords, ['XL', 'Unknown'])
         assert.equal(config.noprogress_piece, 8)
@@ -164,6 +223,27 @@ test('loadConfigFromAria2File: 寄生读取 aria2 conf', () => {
         assert.equal(config.scan_interval, 3000)
         assert.equal(config.rpc_options.rejectUnauthorized, false)
         assert.equal(config.rpc_options.key, 'base64==value==')
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+})
+
+test('loadConfigFromAria2File: disable-ipv6 只能关闭 IPv6，不能覆盖系统探测结果强制开启', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aria2b-test-'))
+    const cfgPath = path.join(tmpDir, 'aria2.conf')
+    const load = (ipv6Detected, line) => {
+        _reset()
+        config.ipv6 = ipv6Detected   // initial() 先 detectIpv6Enabled() 再读配置
+        fs.writeFileSync(cfgPath, line)
+        loadConfigFromAria2File(cfgPath)
+        return config.ipv6
+    }
+    try {
+        // aria2 默认就是 disable-ipv6=false；主机没有 IPv6 时不能因此去跑 ip6tables
+        assert.equal(load(false, 'disable-ipv6=false'), false)
+        assert.equal(load(true, 'disable-ipv6=false'), true)
+        assert.equal(load(true, 'disable-ipv6=true'), false)
+        assert.equal(load(false, 'disable-ipv6=true'), false)
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true })
     }

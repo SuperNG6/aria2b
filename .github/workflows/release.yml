@@ -99,7 +99,8 @@ jobs:
 
           # npm tarball（供 npm 全局安装的用户）
           npm pack --silent
-          sha256sum dist/aria2b > dist/aria2b.sha256
+          # 校验文件只写文件名，用户下载后可在同一目录直接 sha256sum -c
+          (cd dist && sha256sum aria2b > aria2b.sha256)
           sha256sum aria2b-*.tgz > dist/aria2b.tgz.sha256
       - name: Create GitHub release
         env:
