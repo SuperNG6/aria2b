@@ -1,3 +1,16 @@
+# v2.2.8
+
+## 更新
+
+- 默认屏蔽关键词从 `XL,SD,XF,QD,BN` 扩展为 `XL,SD,XF,QD,BN,DL,TS,DT,HP,XM,FG,NX`，无进度监视名单同步更新（仍在末尾带 `Unknown`）。新增的代码参考了 qBittorrent-Enhanced-Edition 当前分支和 PeerBanHelper 的 peer-id 规则，覆盖迅雷系新内核（`dt/torrent`、`hp/torrent`）、`xm/torrent` 刷流量客户端、快车、影音传送带、TorrentStorm 等。
+- 在 aria2.conf 里自定义了 `ab-bt-ban-client-keywords` / `ab-bt-noprogress-keywords` 的用户不受影响，如需新名单请手动更新。
+- README 补充了未默认加入的规则及原因：`TT` 会误命中 `HTTP Seed`；`LT1220` / `LT2070` 离线下载需要 GeoIP 才能区分；`RN` 会封掉所有 Rain 客户端。
+
+## 测试
+
+- 新增回归测试：每个默认关键词都能命中对应 peerId，且不误伤 qBittorrent、µTorrent、Transmission、Deluge、libtorrent、BitComet、aria2 等常见客户端。
+- 137/137 通过（Node 22 / 24）。
+
 # v2.2.7
 
 ## 修复

@@ -4,6 +4,8 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来。本仓库是 [makeding/aria2b](https://github.com/makeding/aria2b) 的维护分支，v2.x 版本只在本仓库发布。
 
+> **v2.2.8**：默认屏蔽关键词新增 `DL,TS,DT,HP,XM,FG,NX`（迅雷系新内核 `dt/torrent` / `hp/torrent`、`xm/torrent`、快车、影音传送带、TorrentStorm 等），参考 qBittorrent-Enhanced-Edition 与 PeerBanHelper 的最新规则；在 aria2.conf 自定义过关键词的用户需手动更新。
+>
 > **v2.2.7**：群晖等老内核上防火墙后端切换、IPv6 不可用改为普通提示，不再输出报错；secret 错误时日志直接提示与 aria2 的 rpc-secret 不一致（此前只显示 `HTTP 400 Bad Request`）；默认关键词 `BN` 等内置表以外的客户端代码现在能命中；封禁时长超过 ipset 上限（2147483 秒）时自动调整而不是无法封禁；IPv6 关闭时不再反复打出未生效的封禁日志；`disable-ipv6=false` 不再强制开启 IPv6；新建 ipset 的 `maxelem` 调到 200000；修正安装说明（npm 上的 `aria2b` 仍是上游 v1.0.9）。
 >
 > **v2.2.6**：修复 IPv6 字面量 RPC 地址无法连接；加速无进度 bitfield 检查，并跳过同轮已成功封禁的重复 IP，减少 CPU 开销、子进程和重复日志。
