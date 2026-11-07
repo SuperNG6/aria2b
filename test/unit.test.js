@@ -9,7 +9,7 @@ const {
     getPeerName, detectPeerClient, processOnePeer,
     formatLocalTimestamp,
     parseList, parsePositiveInteger, parseBoolean,
-    hasUnknownKeyword, keywordMatches,
+    hasUnknownKeyword, keywordMatches, defaultConfig,
     peerStateKey, parseConfigLine,
     isLocalHttpsRpcUrl, hasIpset,
     sanitizeError, maskSecret,
@@ -199,6 +199,27 @@ test('keywordMatches: 子串匹配，但忽略 Unknown 关键字', () => {
     // 'Unknown' 永远不通过字符串匹配命中，得通过 hasUnknownKeyword + client==='unknown' 那条路径
     assert.equal(keywordMatches(['Unknown'], 'Unknown anything'), false)
     assert.equal(keywordMatches([], 'whatever'), false)
+})
+
+test('默认关键词：每个代码都能命中对应 peerId，且不误伤常见正常客户端', () => {
+    const { block_keywords: keywords, noprogress_keywords: noprog } = defaultConfig()
+    // noprogress 名单与封禁名单保持同步，只多一个 Unknown
+    assert.deepEqual(noprog, [...keywords, 'Unknown'])
+    for (const code of keywords) {
+        const c = detectPeerClient(`-${code}0001-123456789012`)
+        assert.equal(keywordMatches(keywords, c.origin), true, code)
+    }
+    const legit = [
+        '-qB5010-123456789012', '-UT3550-123456789012', '-TR4000-123456789012',
+        '-DE2110-123456789012', '-LT2070-123456789012', '-lt0D80-123456789012',
+        '-BT7A00-123456789012', '-AZ5770-123456789012', '-UW1600-123456789012',
+        '-BC0201-123456789012', '-FD0001-123456789012', '-AG1370-123456789012',
+        'A2-1-37-0-1234567890', 'M7-4-4--123456789012', 'exbc\x01\x02LORD12345678',
+    ]
+    for (const id of legit) {
+        const c = detectPeerClient(id)
+        assert.equal(keywordMatches(keywords, c.origin), false, `${id} -> ${c.origin}`)
+    }
 })
 
 // ---------- peerStateKey ----------

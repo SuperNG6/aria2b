@@ -714,8 +714,8 @@ function defaultConfig() {
         secret: '',
         timeout: DEFAULT_TIMEOUT_SECONDS,
         scan_interval: DEFAULT_SCAN_INTERVAL,
-        block_keywords: ['XL', 'SD', 'XF', 'QD', 'BN'],
-        noprogress_keywords: ['XL', 'SD', 'XF', 'QD', 'BN', 'Unknown'],
+        block_keywords: ['XL', 'SD', 'XF', 'QD', 'BN', 'DL', 'TS', 'DT', 'HP', 'XM', 'FG', 'NX'],
+        noprogress_keywords: ['XL', 'SD', 'XF', 'QD', 'BN', 'DL', 'TS', 'DT', 'HP', 'XM', 'FG', 'NX', 'Unknown'],
         noprogress_piece: 5,
         noprogress_wait: 10,
         ipv6: false

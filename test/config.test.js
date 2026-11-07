@@ -159,8 +159,8 @@ test('applyCliConfig: 字符串参数缺值时忽略并警告，不写入 "true"
         console.warn = originalWarn
     }
     assert.equal(config.secret, 'from-conf')
-    assert.deepEqual(config.block_keywords, ['XL', 'SD', 'XF', 'QD', 'BN'])
-    assert.deepEqual(config.noprogress_keywords, ['XL', 'SD', 'XF', 'QD', 'BN', 'Unknown'])
+    assert.deepEqual(config.block_keywords, ['XL', 'SD', 'XF', 'QD', 'BN', 'DL', 'TS', 'DT', 'HP', 'XM', 'FG', 'NX'])
+    assert.deepEqual(config.noprogress_keywords, ['XL', 'SD', 'XF', 'QD', 'BN', 'DL', 'TS', 'DT', 'HP', 'XM', 'FG', 'NX', 'Unknown'])
     assert.equal(config.rpc_url, 'http://127.0.0.1:6800/jsonrpc')
     assert.equal(config.rpc_options.ca, undefined)
     for (const name of ['secret', 'block-keywords', 'noprogress-keywords', 'url', 'rpc-ca']) {

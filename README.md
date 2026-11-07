@@ -139,8 +139,8 @@ aria2b支持寄生配置。会读取aria2本体的配置文件来找 aria2 RPC �
 |-|-|-|-|-|
 | rpc url | -u --url | N/A | http://127.0.0.1:6800/jsonrpc 
 | rpc secret | -s --secret | rpc-secret | N/A | 与 aria2 共享同一字段
-| ban 客户端关键字 | -b --block-keywords | ab-bt-ban-client-keywords | XL,SD,XF,QD,BN | 以,为分割符
-| 需监视进度的客户端关键字 | --noprogress-keywords | ab-bt-noprogress-keywords | XL,SD,XF,QD,BN,Unknown | 以,为分割符
+| ban 客户端关键字 | -b --block-keywords | ab-bt-ban-client-keywords | XL,SD,XF,QD,BN,DL,TS,DT,HP,XM,FG,NX | 以,为分割符
+| 需监视进度的客户端关键字 | --noprogress-keywords | ab-bt-noprogress-keywords | XL,SD,XF,QD,BN,DL,TS,DT,HP,XM,FG,NX,Unknown | 以,为分割符
 | 进度阈值 | --noprogress-piece| ab-bt-noprogress-piece | 5 | 单位：种子的分片数
 | 超过阈值等待次数 | --noprogress-wait | ab-bt-noprogress-wait | 10 |
 | 扫描间隔 | --scan-interval | ab-bt-scan-interval | 5000 | 单位毫秒，范围 1000~60000，超出会被夹到边界
@@ -198,12 +198,23 @@ pm2 startup
 | 客户端 |  Peer名称 |
 |-|-|
 | 迅雷 | XL SD |
+| 迅雷系新内核（`dt/torrent`、`hp/torrent`） | DT HP |
+| `xm/torrent`（刷流量客户端） | XM |
 | 影音先锋 | XF |
 | qq旋风 | QD |
 | 百度网盘 | BN（可能） |
+| 快车 FlashGet | FG |
+| 影音传送带 Net Transport | NX |
+| TorrentStorm | TS |
+| 其他（qBEE / PeerBanHelper 均封禁） | DL |
 | 未知 | Unknown （请注意大写） |
 
-以上吸血 peer 参考了来自隔壁的 [qBittorrent-Enhanced-Edition](https://github.com/c0re100/qBittorrent-Enhanced-Edition/blob/ebe908f186be5fa2aba8710a543b3ac5c92b92fa/src/base/bittorrent/session.cpp#L2226) 项目的源码，在这里表示感谢
+以上吸血 peer 参考了 [qBittorrent-Enhanced-Edition](https://github.com/c0re100/qBittorrent-Enhanced-Edition/blob/v5_1_x/src/base/bittorrent/peer_blacklist.hpp) 与 [PeerBanHelper](https://github.com/PBH-BTN/PeerBanHelper/blob/dev/src/main/resources/profile.yml) 的 peer-id 规则，在这里表示感谢。aria2 RPC 只提供 peerId，拿不到客户端名称，所以只采用了按 peer-id 前缀识别的那部分。
+
+未默认加入的：
+- `TT`（土豆）：关键字按子串匹配，`TT` 会误命中 `HTTP Seed`。
+- `-LT1220-` / `-LT2070-`（PikPak、迅雷的离线下载）：两个参考项目都只封 CN/NL 的 IP，aria2b 没有 GeoIP，直接加入会误封大量正常的 libtorrent 客户端。
+- `-RN0.0.0`（Rain 默认版本号）：关键字只能写到 `RN`，会把所有 Rain 客户端都封掉。
 
 如果还想屏蔽更多的 bt 客户端，可以参考本项目 `app.js` 中内置的 BitTorrent peerId 识别表（没有什么必要啦，就迅雷之类的会吸血）
 ban 未知的 peer 按照需求添加
