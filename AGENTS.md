@@ -129,6 +129,10 @@ runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退�
 28. **aria2.conf 的 `disable-ipv6` 只能关闭 IPv6**，不能覆盖 `detectIpv6Enabled()` 的结果去强制开启。`disable-ipv6=false` 是 aria2 的默认值。
 29. **显式 `-c` 指定的配置文件不可用时进入暂停状态**（`--flush` 时 exit 1），不回落到默认 RPC 配置继续运行。
 30. **寄生配置不支持行尾 `#` 注释**（`parseConfigLine` 只跳过整行注释），README 已说明。
+31. **默认关键词名单有四处要同步**：`defaultConfig()` 的 `block_keywords` / `noprogress_keywords`（后者 = 前者 + `Unknown`）、README 配置表、README「blocklist 参考」表、[test/config.test.js](test/config.test.js) 的断言。unit.test.js 里有回归测试，检查每个默认代码都能命中、不误伤常见正常客户端。名单参考 qBittorrent-Enhanced-Edition 的 `peer_blacklist.hpp` 和 PeerBanHelper 的 `profile.yml`，只取 peer-id 规则，因为 aria2 RPC 拿不到客户端名称。以下几项不要加入默认名单：
+    - `TT`：`keywordMatches` 是子串匹配，会命中 `HTTP Seed`。
+    - `LT1220` / `LT2070`：参考项目要配合 GeoIP 才封，直接加会误封正常的 libtorrent 客户端。
+    - `RN`：只想封 Rain 的 `0.0.0` 默认版本号，写成 `RN` 会把所有 Rain 客户端都封掉。
 
 ## 测试约定
 
