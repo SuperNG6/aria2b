@@ -61,9 +61,12 @@ jobs:
 
           if [ -s RELEASE_NOTES.md ]; then
             awk -v tag="$tag" '
-              $0 == "# " tag { found = 1; print; next }
+              # 标题行不写入正文：GitHub 已把 release 名称（版本号）显示为标题，再印一次会重复。
+              # 同时去掉标题后的前导空行。
+              $0 == "# " tag { found = 1; next }
               found && /^# v[0-9]+\.[0-9]+\.[0-9]+/ { exit }
-              found { print }
+              found && !started && /^[[:space:]]*$/ { next }
+              found { started = 1; print }
               END { if (!found) exit 1 }
             ' RELEASE_NOTES.md > dist/release-notes.md || {
               echo "RELEASE_NOTES.md does not contain a # ${tag} section"
