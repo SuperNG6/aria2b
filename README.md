@@ -4,6 +4,8 @@ aria2 自动 ban 掉迅雷等不受欢迎客户端的脚本（仅限 Linux）
 
 由 [aria2_ban_thunder](https://github.com/makeding/aria2_ban_thunder) 改名而来。本仓库是 [makeding/aria2b](https://github.com/makeding/aria2b) 的维护分支，v2.x 版本只在本仓库发布。
 
+> **v2.2.9**：本机和私有地址（回环、局域网、链路本地）不再被封禁，避免误伤本机、局域网设备和 Docker 网关；aria2.conf 里的 `ab-rpc-no-verify=false` 现在对本地 https 生效；程序内部错误暂停扫描时日志带上堆栈。
+>
 > **v2.2.8**：默认屏蔽关键词新增 `DL,TS,DT,HP,XM,FG,NX`（迅雷系新内核 `dt/torrent` / `hp/torrent`、`xm/torrent`、快车、影音传送带、TorrentStorm 等），参考 qBittorrent-Enhanced-Edition 与 PeerBanHelper 的最新规则；在 aria2.conf 自定义过关键词的用户需手动更新。
 >
 > **v2.2.7**：群晖等老内核上防火墙后端切换、IPv6 不可用改为普通提示，不再输出报错；secret 错误时日志直接提示与 aria2 的 rpc-secret 不一致（此前只显示 `HTTP 400 Bad Request`）；默认关键词 `BN` 等内置表以外的客户端代码现在能命中；封禁时长超过 ipset 上限（2147483 秒）时自动调整而不是无法封禁；IPv6 关闭时不再反复打出未生效的封禁日志；`disable-ipv6=false` 不再强制开启 IPv6；新建 ipset 的 `maxelem` 调到 200000；修正安装说明（npm 上的 `aria2b` 仍是上游 v1.0.9）。
@@ -158,6 +160,8 @@ aria2b支持寄生配置。会读取aria2本体的配置文件来找 aria2 RPC �
 - `HIDE_TIME_PREFIX=1` 日志不带时间前缀（外部 logger/journalctl 通常自己加时间，避免重复）
 
 > **_注意：_** ⚠️寄生配置**不**支持结尾带 # 注释
+
+> 本机和私有地址永远不会被封禁：回环（`127.0.0.0/8`、`::1`）、局域网（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`fc00::/7`）和链路本地地址（`169.254.0.0/16`、`fe80::/10`）。这样不会误伤本机、局域网设备和 Docker 网关。
 
 `--rpc-ca` `--rpc-cert` `--rpc-key` 需要同时配置，不然还是会不信任，这是 Node.js 的[设定](https://nodejs.org/api/tls.html)，这里推荐系统去手动信任 ca 证书来完成而不是这么麻烦（搜索关键词 `update-ca-trust`）
 ## 守护

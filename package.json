@@ -1,6 +1,6 @@
 {
     "name": "aria2b",
-    "version": "2.2.8",
+    "version": "2.2.9",
     "license": "MIT",
     "engines": {
         "node": ">=22 <25"
