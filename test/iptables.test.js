@@ -177,13 +177,13 @@ test('blockIp(IPv6): ipv6 禁用时直接跳过，不调 ipset', async (t) => {
     assert.equal(isBlocked('2001:db8::2'), false, '也不应进本地缓存')
 })
 
-test('blockIp(IPv6): ::1 / fe80 等 IPv6 字面量都能识别', async (t) => {
+test('blockIp(IPv6): 各种写法的公网 IPv6 字面量都能识别', async (t) => {
     config.ipv6 = true
     const spy = spyExecFile()
     t.after(() => spy.restore())
 
-    await blockIp('::1', { origin: 'XL' })
-    await blockIp('fe80::abcd', { origin: 'XL' })
+    await blockIp('2001:db8::', { origin: 'XL' })
+    await blockIp('2400:3200:0:0:0:0:0:1', { origin: 'XL' })
 
     const adds = spy.calls.filter(c => c.file === 'ipset' && c.args[0] === 'add')
     assert.equal(adds.length, 2)
@@ -591,4 +591,19 @@ test('runIdleMode: --flush 一次性 CLI 模式下 idle 触发应 exit(1) 而非
     runIdleMode('test reason')
     assert.equal(exitCode, 1, '--flush 模式失败必须 exit 1，不进 idle')
     assert.equal(_getIdleHeartbeat(), null, '--flush 模式下不能装 idle 心跳')
+})
+
+// ---------- 本机 / 私有地址白名单 ----------
+
+test('blockIp: 本机 / 私有地址不封禁，不调用 ipset，也不进缓存', async (t) => {
+    config.ipv6 = true
+    const spy = spyExecFile()
+    t.after(() => spy.restore())
+
+    const ips = ['127.0.0.1', '10.1.2.3', '172.17.0.1', '172.31.255.254', '192.168.1.1', '169.254.1.1',
+        '::1', 'fe80::abcd', 'fd00::1', 'fc00::1', '::ffff:192.168.1.2']
+    for (const ip of ips) await blockIp(ip, { origin: 'XL' })
+
+    assert.equal(spy.calls.length, 0, '白名单地址不应触发任何 ipset 调用')
+    for (const ip of ips) assert.equal(isBlocked(ip), false, `${ip} 不应进本地缓存`)
 })

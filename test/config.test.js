@@ -270,3 +270,35 @@ test('loadConfigFromAria2File: 非法值被忽略并保留默认', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true })
     }
 })
+
+test('applyCliConfig: 配置文件里显式的 ab-rpc-no-verify=false 不被本地 https 默认值覆盖', () => {
+    const fsMod = require('node:fs'), osMod = require('node:os'), pathMod = require('node:path')
+    const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'a2b-noverify-'))
+    const file = pathMod.join(dir, 'aria2.conf')
+    try {
+        // 显式要求校验：必须保持 rejectUnauthorized=true
+        _reset(); _setArgv(parseArgv([]))
+        fsMod.writeFileSync(file, 'rpc-secure=true\nab-rpc-no-verify=false\n')
+        assert.equal(loadConfigFromAria2File(file), true)
+        applyCliConfig()
+        assert.equal(config.rpc_url, 'https://127.0.0.1:6800/jsonrpc')
+        assert.equal(config.rpc_options.rejectUnauthorized, true)
+
+        // 没写这一项：本地 https 仍默认关闭校验
+        _reset(); _setArgv(parseArgv([]))
+        fsMod.writeFileSync(file, 'rpc-secure=true\n')
+        assert.equal(loadConfigFromAria2File(file), true)
+        applyCliConfig()
+        assert.equal(config.rpc_options.rejectUnauthorized, false)
+
+        // CLI 优先于配置文件
+        _reset(); _setArgv(parseArgv(['--rpc-no-verify', 'true']))
+        fsMod.writeFileSync(file, 'rpc-secure=true\nab-rpc-no-verify=false\n')
+        assert.equal(loadConfigFromAria2File(file), true)
+        applyCliConfig()
+        assert.equal(config.rpc_options.rejectUnauthorized, false)
+    } finally {
+        fsMod.rmSync(dir, { recursive: true, force: true })
+        _reset()
+    }
+})

@@ -71,6 +71,8 @@ runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退�
 - `peerState: Map<key, {uploaded, wait}>`：noprogress 状态机，key 是 `gid\0peerId\0ip`。
 - 两个 Map 都有容量上限（`MAX_BLOCKED_IPS` / `MAX_PEER_STATE`），超限时淘汰最早插入的条目。
 
+`processOnePeer` 开头会跳过三类 peer：已在 `blockedIps` 里的、IPv6 关闭时的 IPv6 peer、本机 / 私有地址（`isProtectedIp`）。
+
 配置合并顺序：`defaultConfig()` → `detectIpv6Enabled()` → aria2.conf 寄生配置（`rpc-secret` / `rpc-listen-port` / `rpc-secure` / `disable-ipv6` 和 `ab-*` 键）→ CLI 参数覆盖。未指定 `-c` 时按 `findAria2Config()` 的顺序搜索配置文件。
 
 ## 关键不变量（修改相关代码时必须保留）
@@ -134,6 +136,54 @@ runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退�
     - `LT1220` / `LT2070`：参考项目要配合 GeoIP 才封，直接加会误封正常的 libtorrent 客户端。
     - `RN`：只想封 Rain 的 `0.0.0` 默认版本号，写成 `RN` 会把所有 Rain 客户端都封掉。
 
+### 封禁范围
+
+32. **本机 / 私有地址永不封禁**（`isProtectedIp`）：回环、RFC1918 私网、`169.254/16`、IPv6 `::1` / `fc00::/7` / `fe80::/10`，以及内嵌这些地址的 IPv4 映射地址。`processOnePeer` 直接跳过（不进状态机、不打日志），`blockIp` 再兜底一次。**不含 `100.64.0.0/10`**：同一运营商内的真实 peer 会以运营商级 NAT 地址出现。启动时从 ipset 同步缓存不做这层过滤。
+
+## 审查与评估须知
+
+审查代码、评估问题严重程度时，先对照下面的实际情况，**不要只凭读代码推断后果**。2026-11 的一次审查里，13 条"问题"经实测只有少数成立，其余是脱离实际部署的想象。拿不准的先实测或查 aria2 源码，没验证过的要明说"未验证"。
+
+### 实际部署（docker-aria2）
+
+- 启动命令是 `aria2b -c /config/aria2.conf -u <本地 rpc url> -s "$SECRET"`；`aria2.conf` 默认不写 `rpc-secret`，secret 只来自 `-s`。
+- 推荐 `network_mode: host` + `cap_add: NET_ADMIN`。bridge 模式下 Docker 默认用 DNAT，peer 的源地址是真实公网 IP。
+- **cron 默认每 2 小时重启一次 aria2b**（`CRA2B=2h`）。重启会补装 iptables 规则、从 ipset 重新同步缓存，所以"运行期间规则被清掉"、"缓存与 ipset 不一致"这类问题最多持续 2 小时；`peerState` 也随之清零。
+- docker-aria2 不会在服务运行时调用 `--flush`。
+- 本地 https RPC 就是自签证书、跳过校验的场景。
+
+### aria2 的真实行为（1.37.0 源码 + 实测）
+
+- `getPeers` 的 `uploadSpeed` / `downloadSpeed` 是 **10 秒滑动窗口均值**，被 choke 后要过几秒才降下来。
+- **每段上传刚开始时速度会虚高**（窗口内只有零点几秒的数据），实测读到过限速值的数倍。`processOnePeer` 用"速度 × 扫描间隔"估算上传量，会被放大几十倍，日志里的"已上传约 N 个分片"不可信。
+- choke 每 10 秒一轮。peer 多、或 aria2 自己还在下载时，单个 peer 的连续上传通常只有 10–35 秒。
+- 握手完成前的 peer 也会出现在 `getPeers` 里，`peerId` 是 20 个 `%00`，识别结果是 `unknown`。
+- aria2 自己的 peerId（`A2-1-37-0-…`）不在内置表里，识别结果是 `unknown`，默认属于无进度监控对象。
+
+### 已确认存在、尚未修复的问题（改动涉及扫描状态机，需先定方案）
+
+- **无进度判定会误封正常的慢速 peer**。实测：真 aria2c 下载者以 10–200KB/s 接收、第一个分片 60 秒内下不完，5 次里有 4 次在约 60 秒时被封；当时真实上传不到 1 个分片，估算值却是 5–78 个分片（上面说的速度虚高所致）。`noprogress_piece` 这道保护实际上形同虚设。
+- **无进度累计被 choke 轮换清零**。速度一旦 ≤ 1KiB/s 就删除整个 `peerState`，而封禁需要连续约 12 次扫描。实测 3 个吸血 peer 时 60 秒内全封；20 个时 5 分钟只封了 6 个，另有 5 个各拿走 7–35MiB 没被封；aria2 处于下载状态时 8 个全封但最晚要 290 秒。后果是封得慢、漏一部分，不是完全失效。
+- `block_keywords` 含 `Unknown`（非默认）时，握手未完成的连接会被当成未知客户端封掉。不能简单地跳过全 0 peerId，否则吸血方用全 0 peerId 就能绕过。
+- secret 以 `-` 开头时 `-s <secret>` 会被当成缺值丢弃。[test/parseargv.test.js](test/parseargv.test.js) 明确要求 `--secret` 后面跟选项时不吞掉它，所以修法应是调用方改用 `--secret=<值>`。
+
+### 评估过、结论是不用处理的
+
+- 封掉 Docker 网关：host 模式和默认 bridge 下都不会发生；现在另有私有地址白名单兜底。
+- ipset 写满（旧 set 的 `maxelem` 65536）后刷屏：需要 24 小时内封 6.5 万个 IP。
+- `-lt....-`（rTorrent）等少数分支没有 `origin`、含高位字节的 peerId 按 Buffer 下标解析会错位：只影响没人会去封的客户端。
+- 启动阶段收到 SIGTERM 时 `stop()` 会直接退出、不等初始化做完：下次启动由不变量 19 自愈。
+- 运行期间规则丢失、手动 `--flush` 后缓存失效：见上面的 2 小时重启。
+- `noprogress_wait=N` 实际是第 N+1 次才封：启动日志已写成"连续命中超过 N 次"，行为不改。
+
+### 实测方法
+
+用 `superng6/aria2:a2b-latest` 镜像（自带 aria2c、Node、ipset/iptables），`--cap-add NET_ADMIN --entrypoint bash` 启动，容器内跑真 aria2c 做种、挂载当前 `app.js` 运行，再用脚本模拟 peer（握手 → interested → 不停 request，不发 bitfield / have 即为吸血 peer；正常 peer 直接用第二个 aria2c）。注意：
+
+- 模拟 peer 的源地址不能用回环或私有地址（白名单会跳过），先 `ip addr add 198.51.100.x/32 dev lo` 再从这些地址出站。
+- 镜像里是 busybox，`grep` 没有 `--line-buffered`；aria2b 的输出直接重定向到文件，不要接管道，否则进程会因管道断开而停止扫描，得到"没有封禁"的假结果。
+- 每组至少跑 2–5 分钟，结论里写明跑了几次、是什么条件。
+
 ## 测试约定
 
 - 只用 `node:test` + `node:assert/strict`，不引入第三方测试框架。
@@ -151,6 +201,6 @@ runLoop → cron() → scheduleNext（成功按 scan_interval，失败指数退�
 
 - Node.js 22–24（`engines: >=22 <25`），CI 覆盖 22 / 24；release 以 `--target=node22` 打包。
 - 系统依赖：`ipset`、`iptables`（IPv6 还需要 `ip6tables`）。Docker 内需要 `NET_ADMIN` capability，**不**用 `--privileged`。
-- IPv6 启用判断：`detectIpv6Enabled()` 只检查 `/proc/net/if_inet6` 是否存在（该文件按网络命名空间区分，禁用 IPv6 时内核不会创建）；aria2.conf 里 `disable-ipv6=true` 时跟随关闭。
+- IPv6 启用判断：`detectIpv6Enabled()` 只检查 `/proc/net/if_inet6` 是否存在（该文件按网络命名空间区分，内核没有 IPv6 协议栈时不存在；仅用 sysctl `disable_ipv6=1` 关闭时文件仍在，会多建一个用不上的 `bt_blacklist6`，不影响运行）；aria2.conf 里 `disable-ipv6=true` 时跟随关闭。
 - 环境变量：`DEV=1` 输出 debug 日志；`HIDE_TIME_PREFIX=1` 日志不带时间前缀。
 - 面向用户的日志和文档用中文，直接描述现象与修复方法。

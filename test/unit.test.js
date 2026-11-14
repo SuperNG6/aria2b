@@ -392,3 +392,38 @@ test('syncBlockedIpsFromIpset: 从 ipset save 同步已封 IP', () => {
     assert.equal(isBlocked('notanip'), false)
     assert.equal(isBlocked('8.8.8.8'), true)
 })
+
+// ---------- isProtectedIp ----------
+
+test('isProtectedIp: 回环 / RFC1918 / 链路本地 / ULA 受保护，公网和 CGNAT 不受保护', () => {
+    const { isProtectedIp } = _internal
+    for (const ip of ['127.0.0.1', '127.255.255.255', '10.0.0.1', '172.16.0.1', '172.31.255.255',
+        '192.168.0.1', '169.254.169.254', '::1', 'fe80::1', 'febf::1', 'fc00::1', 'fdff::1', '::ffff:10.0.0.1']) {
+        assert.equal(isProtectedIp(ip), true, `${ip} 应受保护`)
+    }
+    for (const ip of ['1.2.3.4', '8.8.8.8', '172.15.255.255', '172.32.0.1', '192.167.1.1', '11.0.0.1',
+        '100.64.0.1', '2001:db8::1', '2400:3200::1', 'fec0::1', '::ffff:8.8.8.8', 'not-an-ip', '', undefined]) {
+        assert.equal(isProtectedIp(ip), false, `${ip} 不应受保护`)
+    }
+})
+
+test('processOnePeer: 本机 / 私有地址的 peer 不进封禁队列，也不产生无进度状态', () => {
+    const { processOnePeer, peerState, config, _reset } = _internal
+    _reset()
+    config.ipv6 = true
+    const status = { pieceLength: '1000', numPieces: '10' }
+    const queue = []
+    const mk = (ip, peerId) => ({ ip, peerId, uploadSpeed: '500000', downloadSpeed: '0', bitfield: '0000' })
+    for (const ip of ['192.168.1.5', '172.17.0.1', '127.0.0.1', 'fe80::1', 'fd00::2']) {
+        processOnePeer(mk(ip, '-XL0012-aaaaaaaaaaaa'), 'g1', status, new Set(), queue)       // 关键词路径
+        for (let i = 0; i < 20; i++) processOnePeer(mk(ip, 'zzzzzzzzzzzzzzzzzzzz'), 'g1', status, new Set(), queue)   // 无进度路径
+    }
+    assert.deepEqual(queue, [])
+    assert.equal(peerState.size, 0)
+
+    // 公网地址不受影响
+    processOnePeer(mk('1.2.3.4', '-XL0012-aaaaaaaaaaaa'), 'g1', status, new Set(), queue)
+    assert.equal(queue.length, 1)
+    assert.equal(queue[0].ip, '1.2.3.4')
+    _reset()
+})

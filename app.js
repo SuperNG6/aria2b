@@ -733,6 +733,7 @@ let shuttingDown = false
 let scanTimer = null
 let cronInflight = null
 let idleHeartbeat = null
+let noVerifyExplicit = false   // 用户（配置文件或 CLI）显式设置过 rpc-no-verify
 
 // 间接层：测试时可替换 execFile，便于在没有 ipset 的环境验证调用
 const runtime = {
@@ -877,9 +878,9 @@ function readTlsMaterial(value, name) {
 }
 
 function detectIpv6Enabled() {
-    // /proc/net/if_inet6 是 per-netns 的：容器内禁用 IPv6（--sysctl net.ipv6.conf.all.disable_ipv6=1
-    // 或 boot-time `ipv6.disable=1`）时内核根本不创建这个文件，否则一定存在。
-    // 只看这一个信号源就够了 —— docker alpine 上行为稳定。
+    // /proc/net/if_inet6 是 per-netns 的：内核没有 IPv6 协议栈（boot-time `ipv6.disable=1` 或未加载
+    // ipv6 模块）时不存在。注意 `--sysctl net.ipv6.conf.all.disable_ipv6=1` 只是不分配地址，
+    // 文件仍然存在（内容为空），此时会照常建 bt_blacklist6，只是用不上，不影响运行。
     return fs.existsSync('/proc/net/if_inet6')
 }
 
@@ -898,6 +899,28 @@ function isLocalHttpsRpcUrl(url) {
         return host.startsWith('127.')
     }
     return false
+}
+
+// 本机 / 私有地址永不封禁：回环、RFC1918 私网、链路本地、IPv6 ULA。
+// 这些地址要么是本机和局域网设备，要么是 Docker 网关 / 反向代理转发后的源地址；
+// 封掉一个就可能连带切断经它进来的所有连接（host 网络模式下还包括宿主机上的其他服务）。
+// 不含 100.64.0.0/10（运营商级 NAT）：同一运营商内的真实 peer 会以这个段出现。
+const PROTECTED_ADDRESSES = new net.BlockList()
+for (const [addr, prefix] of [['127.0.0.0', 8], ['10.0.0.0', 8], ['172.16.0.0', 12], ['192.168.0.0', 16], ['169.254.0.0', 16]]) {
+    PROTECTED_ADDRESSES.addSubnet(addr, prefix, 'ipv4')
+}
+for (const [addr, prefix] of [['::1', 128], ['fc00::', 7], ['fe80::', 10]]) {
+    PROTECTED_ADDRESSES.addSubnet(addr, prefix, 'ipv6')
+}
+
+function isProtectedIp(ip) {
+    const v = net.isIP(ip)
+    if (!v) return false
+    // IPv4 映射地址（::ffff:192.168.1.2）按内嵌的 IPv4 判断
+    const mapped = v === 6 && /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip)
+    if (mapped) return isProtectedIp(mapped[1])
+    try { return PROTECTED_ADDRESSES.check(ip, v === 6 ? 'ipv6' : 'ipv4') }
+    catch (_) { return false }
 }
 
 function hasIpset(saveOutput, setName) {
@@ -1394,7 +1417,7 @@ async function ensureIptablesRule(version) {
 /**
  * 启动阶段环境致命错误（IPv4 后端不可用 / ipset 缺失 等）时暂停扫描并保活。
  *
- * 不变量 #15：进程必须保持存活，绝不 process.exit。
+ * 不变量（AGENTS.md「进程存活」第 2 条）：进程必须保持存活，绝不 process.exit。
  *
  * aria2b 在 docker-aria2 镜像里是 s6-overlay v2 的一个 service，s6 默认会无限重启
  * 退出的 service —— 一旦 aria2b 因环境问题（群晖 DSM 老内核 + iptables-nft 不兼容、
@@ -1438,7 +1461,7 @@ function runIdleMode(reason, fix = '修复后重启容器') {
 
     const HOUR = 60 * 60 * 1000
     idleHeartbeat = setInterval(() => {
-        // 不 unref：CLAUDE.md 第 1 条不变量说事件循环里必须有 refed handle，
+        // 不 unref：AGENTS.md「进程存活」第 1 条不变量说事件循环里必须有 refed handle，
         // 否则 Node 会在 keep-alive 池超时后静默 exit(0) → s6 重启 → crash-loop 复发。
         honsole.error(`aria2b 仍处于暂停扫描状态。原因：${reason}。处理：${fix}`)
     }, HOUR)
@@ -1482,6 +1505,7 @@ async function blockIp(ip, info) {
     const v = net.isIP(ip)
     if (!v) { honsole.warn('跳过无效 IP:', ip); return }
     if (v === 6 && !config.ipv6) { honsole.dev('IPv6 已禁用，跳过:', ip); return }
+    if (isProtectedIp(ip)) { honsole.dev('本机 / 私有地址不封禁，跳过:', ip); return }
 
     const setName = v === 6 ? IPSET_NAME_V6 : IPSET_NAME_V4
     try {
@@ -1508,6 +1532,8 @@ function processOnePeer(peer, gid, status, activeKeys, banQueue) {
     // IPv6 关闭（含启动时软降级）时 blockIp 不会封 IPv6，这里直接跳过：
     // 否则无进度检测会反复打出"封禁疑似无进度上传"日志却从未真正封禁。
     if (!config.ipv6 && net.isIP(peer.ip) === 6) return
+    // 本机 / 私有地址不参与任何判定（blockIp 也不会封它们），避免反复打出没有生效的封禁日志。
+    if (isProtectedIp(peer.ip)) return
 
     const decoded = decodePercentEncodedString(peer.peerId)
     const c = detectPeerClient(decoded)
@@ -1681,6 +1707,7 @@ function applyPositiveIntegerConfig(name, value) {
 
 function applyNoVerify(value) {
     const noVerify = parseBoolean(value, true)
+    noVerifyExplicit = true
     config.rpc_options.rejectUnauthorized = !noVerify
 }
 
@@ -1819,8 +1846,8 @@ function applyCliConfig() {
         }
     }
 
-    // 本地 https 默认关验证；用户显式给了 --rpc-no-verify 时尊重用户
-    if (v['rpc-no-verify'] === undefined && isLocalHttpsRpcUrl(config.rpc_url)) {
+    // 本地 https 默认关验证；用户在配置文件（ab-rpc-no-verify）或 CLI 显式设置过时尊重用户
+    if (!noVerifyExplicit && isLocalHttpsRpcUrl(config.rpc_url)) {
         config.rpc_options.rejectUnauthorized = false
     }
 
@@ -1893,12 +1920,14 @@ function installSignalHandlers() {
     // uncaughtException / unhandledRejection 是程序内部 bug，不是环境问题；
     // 暂停扫描并保活（s6-overlay v2 反复重启会拖垮容器；让 aria2b 静默存活，
     // 同容器里 aria2c / AriaNg 继续工作；用户能从日志里看到 stack trace 修 bug）。
+    // 堆栈只含代码位置和错误信息，不含 RPC 请求体，不会带出 secret。
+    const logStack = e => { if (e && typeof e.stack === 'string') honsole.error(e.stack) }
     process.on('uncaughtException', e => {
-        try { honsole.error('uncaughtException:', sanitizeError(e)) } catch (_) {}
+        try { honsole.error('uncaughtException:', sanitizeError(e)); logStack(e) } catch (_) {}
         if (!idleHeartbeat) runIdleMode(`uncaughtException: ${sanitizeError(e)}`, '这是 aria2b 的程序错误，请把这段日志反馈给维护者；重启容器可暂时恢复')
     })
     process.on('unhandledRejection', e => {
-        try { honsole.error('unhandledRejection:', sanitizeError(e)) } catch (_) {}
+        try { honsole.error('unhandledRejection:', sanitizeError(e)); logStack(e) } catch (_) {}
         if (!idleHeartbeat) runIdleMode(`unhandledRejection: ${sanitizeError(e)}`, '这是 aria2b 的程序错误，请把这段日志反馈给维护者；重启容器可暂时恢复')
     })
 }
@@ -2020,7 +2049,7 @@ async function initial() {
 
     honsole.log(`${config.rpc_url} secret: ${maskSecret(config.secret)}`)
     honsole.log(`屏蔽客户端：${config.block_keywords.join(', ')}`)
-    honsole.log(`无进度上传监控：${config.noprogress_keywords.join(', ')}（累计上传 >${config.noprogress_piece} 个分片且进度仍为 0，连续命中 ${config.noprogress_wait} 次后封禁）`)
+    honsole.log(`无进度上传监控：${config.noprogress_keywords.join(', ')}（累计上传 >${config.noprogress_piece} 个分片且进度仍为 0，连续命中超过 ${config.noprogress_wait} 次后封禁）`)
     honsole.log(`扫描间隔 ${config.scan_interval}ms，封禁时长 ${config.timeout}s，IPv6 ${config.ipv6 ? '启用' : '禁用'}`)
     honsole.logt('aria2b 已启动，开始扫描 aria2 peer')
 
@@ -2049,7 +2078,7 @@ module.exports = {
         parseList, parsePositiveInteger, parseBoolean,
         hasUnknownKeyword, keywordMatches,
         peerStateKey, parseConfigLine, readTlsMaterial,
-        isLocalHttpsRpcUrl, hasIpset,
+        isLocalHttpsRpcUrl, hasIpset, isProtectedIp,
         sanitizeError, maskSecret,
         // state mgmt
         getPeerState, cleanupPeerState,
@@ -2081,6 +2110,7 @@ module.exports = {
             if (idleHeartbeat) { clearInterval(idleHeartbeat); idleHeartbeat = null }
             consecutiveFailures = 0
             shuttingDown = false
+            noVerifyExplicit = false
         },
         _getIdleHeartbeat() { return idleHeartbeat },
         _getFailures() { return consecutiveFailures },
